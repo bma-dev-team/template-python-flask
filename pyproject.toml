@@ -1,0 +1,22 @@
+[project]
+name = "bma-dev-team-flask-template"
+version = "0.0.1"
+description = "BMA Dev Team Python/Flask starter template"
+requires-python = ">=3.11"
+dependencies = [
+    "flask>=3.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]

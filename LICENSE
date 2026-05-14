@@ -1,0 +1,19 @@
+LICENSE PLACEHOLDER
+
+This template repository has no license. License terms are set per build,
+based on the buyer's selection on the BuildMyApp platform request:
+
+- Under an Exclusive license, the buyer owns the Foreground IP of the
+  delivered build per BuildMyApp's License Types and IP Rights framework.
+  See https://www.appmarketplace.dev/terms for the full framework, and
+  NOTICES.md in this repo for the per-build declaration of which directories
+  are Foreground vs Background IP.
+
+- Under a Non-Exclusive license, the buyer receives a perpetual, worldwide
+  right to use the Foreground IP for their own purposes, and the Developer
+  retains the right to relicense substantially similar Foreground IP only
+  through BuildMyApp, subject to the revenue-sharing terms in BuildMyApp's
+  /terms Section 4.
+
+When a new build repo is generated from this template, this LICENSE file
+must be replaced with the appropriate license text for that engagement.
