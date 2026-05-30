@@ -5,10 +5,16 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    # Skip CI on draft PRs: an in-progress build keeps its PR in draft, so the
+    # acceptance-criteria stub tests stay red without emailing the operator on
+    # every push. Marking the PR "Ready for review" fires ready_for_review and
+    # runs the job once, so a failure email then means a real problem.
+    if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
