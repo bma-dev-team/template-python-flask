@@ -1,0 +1,10 @@
+# bma.yaml - build manifest read by BMA's hosting + walkthrough tooling.
+# port + health_check_path are consumed by the web-hosted delivery provisioner;
+# screens is consumed by the visual-walkthrough screenshot pass.
+port: 8080
+health_check_path: /health
+screens:
+  # One entry per screen the operator walks. bma-execute-build init scaffolds
+  # these from the build's screens; the demo seed must populate each path.
+  - name: Health
+    path: /health
