@@ -6,6 +6,8 @@ returns the URL to redirect to so the operator lands on a populated screen.
 The template ships a no-op that redirects to /health; bma-execute-build init
 scaffolds a build-shaped version.
 """
+# bma:template-default - bma-execute-build init regenerates this file from the
+# build's ACs while this marker is present; the generated version drops it.
 from __future__ import annotations
 
 
