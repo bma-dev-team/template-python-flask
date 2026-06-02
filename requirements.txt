@@ -1,4 +1,5 @@
 flask>=3.0
+gunicorn>=21.2  # production WSGI server (Railway deploy reads Procfile)
 python-dotenv>=1.0
 pytest>=8.0
 pyyaml>=6.0
