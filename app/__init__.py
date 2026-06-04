@@ -27,10 +27,7 @@ def create_app(config: dict | None = None) -> Flask:
 
     app.config["REVIEW_INSTANCE"] = _resolve_review_instance(app)
 
-    from app.demo import bp as demo_bp, review_login_disabled
-
-    if app.config["REVIEW_INSTANCE"]:
-        app.register_blueprint(demo_bp)
+    from app.demo import review_login_disabled
 
     if review_login_disabled(
         review_instance=app.config["REVIEW_INSTANCE"], testing=app.testing

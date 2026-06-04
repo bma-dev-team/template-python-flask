@@ -9,15 +9,6 @@ def test_review_login_disabled_truth_table():
     assert review_login_disabled(review_instance=False, testing=True) is False
 
 
-def test_seed_route_registered_and_redirects_when_review_on():
-    app = create_app({"REVIEW_INSTANCE": True, "TESTING": True})
-    client = app.test_client()
-    resp = client.get("/demo/seed")
-    assert resp.status_code == 302
-
-
-def test_seed_route_absent_when_review_off():
-    app = create_app({"REVIEW_INSTANCE": False, "TESTING": True})
-    client = app.test_client()
-    resp = client.get("/demo/seed")
-    assert resp.status_code == 404
+def test_no_demo_seed_route():
+    app = create_app({"TESTING": True, "REVIEW_INSTANCE": True})
+    assert app.test_client().get("/demo/seed").status_code == 404
