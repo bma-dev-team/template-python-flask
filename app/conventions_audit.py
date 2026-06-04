@@ -112,12 +112,15 @@ def check_removable_uploads(rel: str, text: str, lines: list[str]) -> list[Viola
 
 
 def check_timestamps_wrapped(rel: str, text: str, lines: list[str]) -> list[Violation]:
-    """UX-IV: a Jinja timestamp expression (`{{ ..._at }}`) must be inside a <time datetime=...>."""
+    """UX-IV: a Jinja timestamp expression (`{{ ..._at }}`) must be inside a <time datetime=...>
+    or delegated to the localized_time() macro from _bma_ui.html."""
     out = []
     for m in _TS_EXPR_RE.finditer(text):
         line = _line_of(text, m.start())
         line_text = lines[line - 1] if 0 <= line - 1 < len(lines) else ""
         if "<time" in line_text or 'datetime="' in line_text:
+            continue
+        if "localized_time(" in line_text:
             continue
         if _allowed("UX-IV", lines, line):
             continue
