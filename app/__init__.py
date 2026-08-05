@@ -25,6 +25,17 @@ def create_app(config: dict | None = None) -> Flask:
     if config:
         app.config.update(config)
 
+    # CSRF protection (Flask-WTF). Registers the `csrf_token()` Jinja global the
+    # shared form macros (_bma_ui.html: gated_form, remove_x, credentials_section)
+    # emit, and validates the token on state-changing requests. Disabled under
+    # TESTING so build test suites can POST without threading a token through
+    # every request; production always runs with it on. A build exempts specific
+    # non-form routes (webhooks, JSON APIs) with @csrf.exempt as needed.
+    app.config.setdefault("WTF_CSRF_ENABLED", not app.testing)
+    from flask_wtf import CSRFProtect
+
+    CSRFProtect(app)
+
     app.config["REVIEW_INSTANCE"] = _resolve_review_instance(app)
 
     from app.demo import review_login_disabled

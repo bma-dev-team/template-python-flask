@@ -1,4 +1,5 @@
 flask>=3.0
+flask-wtf>=1.2  # CSRF protection + csrf_token() for the shared form macros (_bma_ui.html)
 gunicorn>=21.2  # production WSGI server (Railway deploy reads Procfile)
 python-dotenv>=1.0
 pytest>=8.0
