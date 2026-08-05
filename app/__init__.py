@@ -5,13 +5,19 @@ from flask import Flask
 
 def _resolve_review_instance(app: Flask) -> bool:
     """REVIEW_INSTANCE precedence: explicit config wins, then the REVIEW_INSTANCE
-    env var (1/true/yes/on), else default to debug/testing. Off on a real deploy."""
+    env var (1/true/yes/on), else TESTING only. Off on a real deploy.
+
+    Never inferred from ``app.debug``: setting FLASK_DEBUG=1 on a real deploy must
+    NOT flip this on, because a review instance disables login. The old
+    ``app.debug or app.testing`` fallback meant a debug flag silently disabled
+    auth and exposed every route (and the Werkzeug console) on a public URL,
+    reproduced in the deposition build's security review, 2026-08-05."""
     if "REVIEW_INSTANCE" in app.config and app.config["REVIEW_INSTANCE"] is not None:
         return bool(app.config["REVIEW_INSTANCE"])
     env = os.environ.get("REVIEW_INSTANCE")
     if env is not None:
         return env.strip().lower() in ("1", "true", "yes", "on")
-    return bool(app.debug or app.testing)
+    return bool(app.testing)
 
 
 def create_app(config: dict | None = None) -> Flask:
