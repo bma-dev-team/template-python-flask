@@ -1,6 +1,10 @@
 import os
 
-from app.conventions_audit import audit, check_sqlite_foreign_keys
+from app.conventions_audit import (
+    audit,
+    check_sqlite_foreign_keys,
+    check_sqlite_batch_migration_guard,
+)
 
 
 def test_no_convention_violations():
@@ -43,3 +47,54 @@ def test_sqlite_fk_check_noop_without_orm(tmp_path):
     root = str(tmp_path)
     _write(root, "app/__init__.py", "def create_app():\n    return None\n")
     assert check_sqlite_foreign_keys(root) == []
+
+
+def test_batch_migration_check_flags_missing_guard(tmp_path):
+    root = str(tmp_path)
+    _write(root, "migrations/env.py", "def run_migrations_online():\n    pass\n")
+    _write(root, "migrations/versions/0001_x.py",
+           "def upgrade():\n    with op.batch_alter_table('participant') as b:\n        b.drop_column('x')\n")
+    violations = check_sqlite_batch_migration_guard(root)
+    assert len(violations) == 1
+    assert violations[0].rule == "SQLITE-BATCH-MIGRATION"
+
+
+def test_batch_migration_check_passes_with_guard(tmp_path):
+    root = str(tmp_path)
+    _write(root, "migrations/env.py",
+           "def run_migrations_online():\n"
+           "    with sqlite_foreign_keys_suspended(connection):\n"
+           "        conn.exec_driver_sql('PRAGMA foreign_keys=OFF')\n"
+           "        conn.exec_driver_sql('PRAGMA foreign_key_check')\n"
+           "        run_migrations()\n")
+    _write(root, "migrations/versions/0001_x.py",
+           "def upgrade():\n    with op.batch_alter_table('participant') as b:\n        b.drop_column('x')\n")
+    assert check_sqlite_batch_migration_guard(root) == []
+
+
+def test_batch_migration_check_noop_without_batch(tmp_path):
+    root = str(tmp_path)
+    _write(root, "migrations/env.py", "def run_migrations_online():\n    pass\n")
+    _write(root, "migrations/versions/0001_x.py",
+           "def upgrade():\n    op.add_column('participant', 'x')\n")
+    assert check_sqlite_batch_migration_guard(root) == []
+
+
+def test_batch_migration_check_noop_without_migrations(tmp_path):
+    root = str(tmp_path)
+    _write(root, "app/__init__.py", "x = 1\n")
+    assert check_sqlite_batch_migration_guard(root) == []
+
+
+def test_batch_migration_check_flags_inline_suspend_without_check(tmp_path):
+    root = str(tmp_path)
+    _write(root, "migrations/env.py",
+           "def run_migrations_online():\n"
+           "    conn.exec_driver_sql('PRAGMA foreign_keys=OFF')\n"
+           "    run_migrations()\n")
+    _write(root, "migrations/versions/0001_x.py",
+           "def upgrade():\n    with op.batch_alter_table('participant') as b:\n        b.drop_column('x')\n")
+    v = check_sqlite_batch_migration_guard(root)
+    assert len(v) == 1
+    assert v[0].rule == "SQLITE-BATCH-MIGRATION"
+    assert "foreign_key_check" in v[0].message

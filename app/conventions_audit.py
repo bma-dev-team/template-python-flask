@@ -214,6 +214,74 @@ def check_sqlite_foreign_keys(app_root: str) -> list[Violation]:
     return []
 
 
+def check_sqlite_batch_migration_guard(app_root: str) -> list[Violation]:
+    """SQLITE-BATCH-MIGRATION: a build whose Alembic migrations use
+    ``batch_alter_table`` must, in ``migrations/env.py``, suspend SQLite
+    foreign-key enforcement around the migration run AND run
+    ``PRAGMA foreign_key_check``.
+
+    Why env.py and not the migration: SQLite ignores ``PRAGMA foreign_keys``
+    while a transaction is open, in both directions. A migration can turn it OFF
+    (it runs before any DML) but cannot turn it back ON, because by its ``finally``
+    the batch copy's INSERT has opened a transaction and the restore is silently
+    discarded. So the suspension must wrap ``run_migrations()`` in env.py, which is
+    where the per-migration transactions are opened. Why it matters: on SQLite a
+    ``batch_alter_table`` rebuild of a foreign-key *parent* does an implicit
+    ``DELETE`` that fires ``ON DELETE`` actions on children, so rebuilding one table
+    can silently strip rows (e.g. null every line's speaker) from another. The
+    ``foreign_key_check`` makes any violation loud instead of silent.
+
+    No-op for builds with no ``migrations/env.py`` or that never batch-migrate."""
+    env_py = os.path.join(app_root, "migrations", "env.py")
+    if not os.path.isfile(env_py):
+        return []
+    versions = os.path.join(app_root, "migrations", "versions")
+    uses_batch = False
+    if os.path.isdir(versions):
+        for root, _dirs, files in os.walk(versions):
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                try:
+                    with open(os.path.join(root, name), encoding="utf-8") as fh:
+                        if "batch_alter_table" in fh.read():
+                            uses_batch = True
+                            break
+                except (OSError, UnicodeDecodeError):
+                    continue
+            if uses_batch:
+                break
+    if not uses_batch:
+        return []
+    try:
+        with open(env_py, encoding="utf-8") as fh:
+            env_lc = fh.read().lower()
+    except (OSError, UnicodeDecodeError):
+        return []
+    # The canonical guard is the ``sqlite_foreign_keys_suspended()`` context
+    # manager (it does suspend + foreign_key_check + restore in one place); when
+    # env.py uses it, trust it and don't demand the pragmas be inlined here too.
+    if "foreign_keys_suspended" in env_lc:
+        return []
+    problems = []
+    if "foreign_keys=off" not in env_lc.replace(" ", ""):
+        problems.append("no SQLite foreign-key suspension around the migration run")
+    elif "foreign_key_check" not in env_lc:
+        problems.append(
+            "suspends foreign keys inline but has no PRAGMA foreign_key_check to "
+            "surface violations"
+        )
+    if not problems:
+        return []
+    rel = os.path.relpath(env_py, app_root)
+    return [Violation(
+        "SQLITE-BATCH-MIGRATION", rel, 1,
+        "migrations use batch_alter_table but env.py has " + "; ".join(problems)
+        + " -- a SQLite batch rebuild of a foreign-key parent fires ON DELETE and "
+        "can silently strip child rows",
+    )]
+
+
 def _templates(app_root: str):
     tdir = os.path.join(app_root, "app", "templates")
     for root, _dirs, files in os.walk(tdir):
@@ -233,4 +301,5 @@ def audit(app_root: str) -> list[Violation]:
             out.extend(check(rel, text, lines))
     out.extend(check_foundation_scripts(app_root))
     out.extend(check_sqlite_foreign_keys(app_root))
+    out.extend(check_sqlite_batch_migration_guard(app_root))
     return sorted(out, key=lambda v: (v.file, v.line, v.rule))
