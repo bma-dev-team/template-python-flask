@@ -154,6 +154,66 @@ def check_foundation_scripts(app_root: str) -> list[Violation]:
     return out
 
 
+_ORM_USAGE_RE = re.compile(
+    r"(?:from\s+flask_sqlalchemy\s+import|import\s+flask_sqlalchemy"
+    r"|from\s+sqlalchemy(?:\.\w+)*\s+import|import\s+sqlalchemy"
+    r"|SQLAlchemy\s*\()"
+)
+_FK_PRAGMA_RE = re.compile(r"foreign_keys\s*=\s*on\b", re.IGNORECASE)
+
+
+def _app_python_files(app_root: str):
+    """Yield (relpath, text) for each .py under app/, skipping this auditor
+    itself (its own docstring/message name the strings it scans for)."""
+    adir = os.path.join(app_root, "app")
+    for root, _dirs, files in os.walk(adir):
+        for name in sorted(files):
+            if not name.endswith(".py") or name == "conventions_audit.py":
+                continue
+            path = os.path.join(root, name)
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    yield os.path.relpath(path, app_root), fh.read()
+            except (OSError, UnicodeDecodeError):
+                continue
+
+
+def check_sqlite_foreign_keys(app_root: str) -> list[Violation]:
+    """SQLITE-FK: an app that uses SQLAlchemy must enable SQLite foreign-key
+    enforcement on Engine connect, or ON DELETE / passive_deletes silently
+    no-op on the SQLite backend (local dev and the SQLite half of the test
+    matrix) while Postgres enforces them. That two-backend divergence has
+    drawn blood on this platform more than once (an ac-01 truncation 500, an
+    ac-03 orphaned-rows-on-delete). No-op for apps without SQLAlchemy, so the
+    bare template and any headless build pass untouched.
+
+    Canonical fix (register on the Engine class so it covers app, migrations
+    and the test harness alike; it is a no-op on Postgres):
+
+        @event.listens_for(Engine, "connect")
+        def _enforce_sqlite_foreign_keys(dbapi_connection, _record):
+            if isinstance(dbapi_connection, sqlite3.Connection):
+                cur = dbapi_connection.cursor()
+                cur.execute("PRAGMA foreign_keys=ON")
+                cur.close()
+    """
+    orm_file = None
+    has_pragma = False
+    for rel, text in _app_python_files(app_root):
+        if orm_file is None and _ORM_USAGE_RE.search(text):
+            orm_file = rel
+        if _FK_PRAGMA_RE.search(text):
+            has_pragma = True
+    if orm_file is not None and not has_pragma:
+        return [Violation(
+            "SQLITE-FK", orm_file, 1,
+            "app uses SQLAlchemy but no SQLite foreign-key pragma (PRAGMA "
+            "foreign_keys ON via an Engine 'connect' listener) was found; "
+            "SQLite silently skips ON DELETE / passive_deletes",
+        )]
+    return []
+
+
 def _templates(app_root: str):
     tdir = os.path.join(app_root, "app", "templates")
     for root, _dirs, files in os.walk(tdir):
@@ -172,4 +232,5 @@ def audit(app_root: str) -> list[Violation]:
         for check in _PER_TEMPLATE_CHECKS:
             out.extend(check(rel, text, lines))
     out.extend(check_foundation_scripts(app_root))
+    out.extend(check_sqlite_foreign_keys(app_root))
     return sorted(out, key=lambda v: (v.file, v.line, v.rule))
