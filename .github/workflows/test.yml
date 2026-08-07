@@ -6,10 +6,29 @@ on:
   pull_request:
     branches: [main]
     types: [opened, synchronize, reopened, ready_for_review]
+  # Run the suite on any branch, on demand, without merging and without taking
+  # a PR out of draft. Without this the triggers above mean a build branch's
+  # FIRST execution on a CI-pinned interpreter is the merge to main, so an
+  # interpreter-specific failure lands after the point of no return. The
+  # deposition build hit exactly that: fourteen review rounds of a migration
+  # guard, every green number produced on the developer's 3.12, while CI pins
+  # the 3.11 floor.
+  workflow_dispatch:
 
 jobs:
   pytest:
     runs-on: ubuntu-latest
+    strategy:
+      # Both ends of the supported range, because testing only one leaves the
+      # other to be discovered somewhere worse. pyproject declares
+      # requires-python = ">=3.11" (a floor, not a pin) and nothing pins the
+      # deploy runtime, so 3.11 catches use of anything newer than the floor
+      # allows and 3.12 catches breakage on what developers and the deploy
+      # actually run. fail-fast off so one version's failure does not cancel
+      # the other's result; when they disagree, the disagreement is the finding.
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
     # Skip CI on draft PRs: an in-progress build keeps its PR in draft, so the
     # acceptance-criteria stub tests stay red without emailing the operator on
     # every push. Marking the PR "Ready for review" fires ready_for_review and
@@ -19,7 +38,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
