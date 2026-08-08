@@ -1108,6 +1108,195 @@ def test_the_operators_interrupt_wins_not_the_one_the_guard_provoked(
         engine.dispose()
 
 
+def test_an_orphan_that_predates_the_run_is_not_blamed_on_it(tmp_path):
+    """ac-01. The report is about the run, and `foreign_key_check` is not.
+
+    The check scans the whole database, so on its own it cannot tell a row the run
+    orphaned from one that was already there -- a legacy file, a partial restore,
+    a hand edit made with enforcement off, which is how SQLite ships. Reported
+    without a baseline, such a row is attributed to a migration that did not cause
+    it, and because nothing ever clears it, it fails *every* subsequent run. A
+    bootstrap command that calls `upgrade()` is then a release step that can never
+    be run again on that database.
+
+    Two runs, not one. A baseline makes the first run clean; only the second shows
+    that the condition does not accumulate.
+
+    This covers the plain case only: one pre-existing orphan and the baseline
+    subtracting it. It says nothing about *how* the baseline is keyed, and it
+    cannot -- both tables here have an `INTEGER PRIMARY KEY`, so the rowid happens
+    to survive a rebuild and a row-keyed diff would pass this too. The two
+    renumbering tests above are what hold the key.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "predates_the_run.db")
+    try:
+        _an_orphan_written_the_only_way_one_can_exist(engine)
+
+        for run in (1, 2):
+            with engine.connect() as connection:
+                # No `pytest.raises`: not failing is the behaviour under test.
+                with sqlite_foreign_keys_suspended(connection):
+                    _a_batch_rebuild_of_the_parent(connection)
+            assert _foreign_key_enforcement(engine) == {1}, (
+                f"run {run} left the pool disarmed"
+            )
+
+        # The orphan is still there -- the runs did not quietly repair it, which
+        # would make the two clean runs above prove nothing.
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall(), (
+                "the pre-existing orphan disappeared, so nothing was subtracted "
+                "and this test would pass with no baseline at all"
+            )
+    finally:
+        engine.dispose()
+
+
+def test_a_failure_inside_the_guards_own_exit_still_restores_enforcement(tmp_path):
+    """ac-01. Nothing in the exit path gets to run ahead of the restore.
+
+    The exit path does two things -- put the pragma back, and report what the
+    suspension let through -- and only one of them is what protects the pool. If
+    the report runs first and raises, the restore, the read-back and the
+    `invalidate()` are all skipped, the connection closes normally, and whoever
+    checks it out next runs unenforced. That is worse than the violation the
+    report was trying to surface, because it is silent.
+
+    **Do not drop this one when trimming.** It is the only evidence for the
+    documented fail-open below it: that a run whose check was already broken is
+    not failed, but is said out loud.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "failure_inside_the_exit.db")
+    reported = _errors_from_the_guard()
+    try:
+        with engine.connect() as connection:
+            _a_check_that_cannot_run(connection)
+
+        with reported:
+            with engine.connect() as connection:
+                with sqlite_foreign_keys_suspended(connection):
+                    pass
+
+        assert _foreign_key_enforcement(engine) == {1}, (
+            "the exit path failed before the restore and handed the pool a "
+            "connection with enforcement still switched off"
+        )
+        # The check was broken before this run started, so the run is not failed
+        # over it -- failing would wedge every future migration on a condition
+        # that predates them all, which is the same trap the baseline exists to
+        # avoid. It is still said out loud, because the run went unverified.
+        assert any(
+            "has NOT been failed over it" in message for message in reported.messages
+        ), f"the unverified run passed without saying so; logged: {reported.messages}"
+    finally:
+        engine.dispose()
+
+
+def test_the_one_fail_open_warns_about_the_run_rather_than_excusing_it(tmp_path):
+    """ac-01. The deliberate fail-open, pinned as deliberate.
+
+    When `foreign_key_check` cannot run on either side of the migration, the run
+    is not failed -- because that condition never clears, and a permanently
+    failing bootstrap is worse than a logged warning. That decision is kept. What
+    it costs is real and is asserted here: a run can commit a genuine violation,
+    exit 0, and be reported only in a log line.
+
+    Which is why the wording is a test and not a preference. The first version
+    said the database "was already unverifiable and the run has not been failed
+    over it" -- true, reassuring, and silent about the run possibly having
+    destroyed data. On the one path where this guard does not fail closed, the
+    message is the entire safety mechanism.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "the_one_fail_open.db")
+    reported = _errors_from_the_guard()
+    try:
+        with engine.connect() as connection:
+            _a_check_that_cannot_run(connection)
+
+        with engine.connect() as connection:
+            with reported:
+                # No `pytest.raises`: not failing is the behaviour under test.
+                with sqlite_foreign_keys_suspended(connection):
+                    connection.exec_driver_sql(
+                        "INSERT INTO child (id, label, parent_id) "
+                        "VALUES (2, 'nobody', 987654)"
+                    )
+                    connection.commit()
+
+        # Specifically an orphan, not merely a row: a fixture that later adds a
+        # legitimate child would satisfy a bare count vacuously, and the point of
+        # this test is that the fail-open let real damage through.
+        with engine.connect() as connection:
+            orphans = connection.exec_driver_sql(
+                "SELECT count(*) FROM child WHERE parent_id NOT IN "
+                "(SELECT id FROM parent)"
+            ).scalar()
+        assert orphans == 1, "the run did not actually commit a foreign key violation"
+
+        message = " ".join(reported.messages)
+        assert "may have left foreign key violations" in message, (
+            f"the fail-open reported the database's state and not the run's risk; "
+            f"logged: {message}"
+        )
+        assert "exits 0" in message, (
+            "the message does not tell the operator that the exit status will not "
+            "carry this, which is the only thing that makes it actionable"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_a_rebuild_of_a_cascade_parent_keeps_the_children(tmp_path):
+    """ac-01. The other data-loss path, and the bigger one.
+
+    Ported from `test_rolling_back_past_the_session_rebuild_keeps_the_participants`.
+    In the originating build a downgrade batch-dropped two columns from a table
+    that was the parent of an `ON DELETE CASCADE` child, so an unguarded rollback
+    past that point did not merely null a reference: it deleted every child row.
+    Measured there with the guard removed, the child table went to 0.
+
+    `ON DELETE SET NULL` -- what the shared fixture uses, and what the headline
+    rebuild test exercises -- loses the *reference*. `ON DELETE CASCADE` loses the
+    *row*. They are different severities of the same mechanism and the guard has
+    to hold both, so this builds the cascade shape rather than borrowing the
+    fixture's.
+    """
+    engine = _engine_with_enforcement(tmp_path / "cascade_parent_rebuild.db")
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql("CREATE TABLE room (id INTEGER PRIMARY KEY, label TEXT)")
+            connection.exec_driver_sql(
+                "CREATE TABLE occupant (id INTEGER PRIMARY KEY, name TEXT, "
+                "room_id INTEGER REFERENCES room(id) ON DELETE CASCADE)"
+            )
+            connection.exec_driver_sql("INSERT INTO room (id, label) VALUES (1, 'room 3')")
+            for i, name in enumerate(("first", "second", "third"), start=1):
+                connection.exec_driver_sql(
+                    f"INSERT INTO occupant (id, name, room_id) VALUES ({i}, '{name}', 1)"
+                )
+            connection.commit()
+
+        with engine.connect() as connection:
+            with sqlite_foreign_keys_suspended(connection):
+                # `batch_alter_table('room') as batch_op: drop_column('label')`
+                connection.exec_driver_sql("CREATE TABLE _tmp_room (id INTEGER PRIMARY KEY)")
+                connection.exec_driver_sql("INSERT INTO _tmp_room (id) SELECT id FROM room")
+                connection.exec_driver_sql("DROP TABLE room")
+                connection.exec_driver_sql("ALTER TABLE _tmp_room RENAME TO room")
+                connection.commit()
+
+        with engine.connect() as connection:
+            surviving = connection.exec_driver_sql(
+                "SELECT id, name, room_id FROM occupant ORDER BY id"
+            ).fetchall()
+        assert [tuple(row) for row in surviving] == [
+            (1, "first", 1), (2, "second", 1), (3, "third", 1)
+        ], "the rebuild cascaded and emptied the room"
+        assert _foreign_key_enforcement(engine) == {1}
+    finally:
+        engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # The two proofs that CANNOT be schema-agnostic.
 #
