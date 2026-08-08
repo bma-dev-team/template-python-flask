@@ -36,3 +36,7 @@ dist/
 .DS_Store
 
 _dossier
+
+# Operator tooling: agent worktrees, skill copies, local settings. Never the
+# deliverable, and a broad `git add` here would ship it to the buyer.
+.claude/

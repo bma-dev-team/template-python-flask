@@ -278,7 +278,15 @@ def check_sqlite_batch_migration_guard(app_root: str) -> list[Violation]:
         "SQLITE-BATCH-MIGRATION", rel, 1,
         "migrations use batch_alter_table but env.py has " + "; ".join(problems)
         + " -- a SQLite batch rebuild of a foreign-key parent fires ON DELETE and "
-        "can silently strip child rows",
+        "can silently strip child rows. FIX: use the shipped guard, do not "
+        "hand-roll the pragmas. In migrations/env.py: `from "
+        "app.sqlite_migration_guard import sqlite_foreign_keys_suspended`, then "
+        "`with context.begin_transaction(): with "
+        "sqlite_foreign_keys_suspended(connection): context.run_migrations()`. "
+        "The guard exists because six hand-rolled rounds each repaired one path "
+        "and opened another. Note `flask db init` regenerates env.py without it, "
+        "so the call is re-added by hand after any re-init -- which is the case "
+        "this check exists to catch",
     )]
 
 
