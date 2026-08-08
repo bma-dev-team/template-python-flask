@@ -458,6 +458,47 @@ def test_a_rebuild_does_not_strip_the_child_rows_on_a_schema_built_here(tmp_path
         engine.dispose()
 
 
+# The tests here that travelled under a DIFFERENT name than they had in the
+# originating build, as data rather than as prose.
+#
+# Four names changed, because four of these tests were named after the schema
+# they were bound to and the whole point of the port is that they no longer are.
+# Each rename was recorded only inside the ported test's own docstring, and the
+# cost of that showed up three separate times: a port audit that diffs the
+# originating build's classification list against the function names in this file
+# reports every renamed test as unported. It did so at 17-remaining, then at
+# 16-remaining, then at 1-remaining -- each time reporting real work as missing
+# and inviting someone to do it twice.
+#
+# So the map is here, machine-readable, and `test_every_rename_points_at_a_test
+# _that_exists` keeps it honest. Rename a test in this file and that test fails
+# until this map is updated with it.
+PORTED_FROM = {
+    "test_the_invariant_holds_on_a_schema_the_guard_has_never_seen":
+        "test_no_statement_in_the_guard_can_leave_the_pool_disarmed",
+    "test_a_rebuild_does_not_strip_the_child_rows_on_a_schema_built_here":
+        "test_rolling_the_title_column_back_does_not_unname_the_testimony",
+    "test_a_rebuild_of_a_cascade_parent_keeps_the_children":
+        "test_rolling_back_past_the_session_rebuild_keeps_the_participants",
+}
+
+
+def test_every_rename_points_at_a_test_that_exists():
+    """`PORTED_FROM` is the record of the port, so it may not go stale.
+
+    A map naming a function that is no longer here is worse than no map: an audit
+    reads it, believes the property travelled, and finds nothing. This is the only
+    thing standing between that map and the prose it replaced.
+    """
+    here = set(globals())
+    for ported, original in PORTED_FROM.items():
+        assert ported in here, (
+            f"PORTED_FROM names {ported}, which is not defined in this file. It was "
+            f"the port of {original}; either restore it or remove the entry, but do "
+            f"not leave the map claiming a proof that is not here."
+        )
+
+
 def test_the_guard_tests_actually_ran():
     """Fail loudly in CI if the guard's tests were skipped rather than run.
 
