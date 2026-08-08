@@ -17,6 +17,7 @@ the standard library; see app/sqlite_migration_guard.py.
 """
 import gc
 import importlib.util
+import logging
 import os
 import sqlite3
 from collections import Counter
@@ -32,7 +33,95 @@ sa = pytest.importorskip(
 from sqlalchemy import create_engine          # noqa: E402
 from sqlalchemy.pool import StaticPool        # noqa: E402
 
+import app.sqlite_migration_guard as guard                          # noqa: E402
 from app.sqlite_migration_guard import sqlite_foreign_keys_suspended  # noqa: E402
+
+
+class _errors_from_the_guard(logging.Handler):
+    """What the guard logged, collected off its own logger rather than `caplog`.
+
+    Attached by name to the guard's module logger. In the originating build this
+    was a workaround with teeth: Alembic's `env.py` calls `fileConfig()` on every
+    migration invocation, which removes the root-logger handler `caplog`
+    installs, so `caplog.records` came back empty while the message was plainly
+    on stderr. Nothing here runs Alembic, so `caplog` would work -- but a build
+    that instantiates the two stubs below *will* run it, and will reach for this
+    file's idiom when it does. Kept for that reader.
+
+    On the fail-open path the guard's log line is the entire safety mechanism:
+    the run exits 0 having possibly committed a violation, and this is what
+    reads the sentence that tells the operator so.
+    """
+
+    def __init__(self):
+        super().__init__(logging.ERROR)
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
+
+    def __enter__(self):
+        logging.getLogger(guard.__name__).addHandler(self)
+        return self
+
+    def __exit__(self, *_exc):
+        logging.getLogger(guard.__name__).removeHandler(self)
+        return False
+
+
+def _a_check_that_cannot_run(connection):
+    """Make `PRAGMA foreign_key_check` raise rather than return rows, for good.
+
+    A foreign key whose parent column carries no unique index cannot be checked:
+    SQLite raises `foreign key mismatch` instead of reporting. `parent.label` is
+    an ordinary TEXT column, so pointing at it is enough.
+
+    Any failure of the check would serve -- the one found in review was a lock
+    timeout -- but this one is deterministic and needs no second writer. It fails
+    the check on BOTH sides of the run, which is what reaches the guard's one
+    documented fail-open.
+    """
+    connection.exec_driver_sql(
+        "CREATE TABLE stray (id INTEGER PRIMARY KEY, who TEXT REFERENCES parent(label))"
+    )
+    connection.commit()
+
+
+def _an_orphan_written_the_only_way_one_can_exist(engine, child_id=987654):
+    """A child pointing at a parent that is not there, committed before the run.
+
+    Enforcement is switched off to write it, because that is the only way such a
+    row comes to exist at all: a legacy file, a partial restore, a hand edit made
+    with the pragma at SQLite's shipped default of OFF.
+    """
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.exec_driver_sql(
+            "INSERT INTO child (id, label, parent_id) "
+            f"VALUES ({child_id}, 'from an older file', 987654)"
+        )
+        connection.commit()
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+
+def _a_batch_rebuild_of_the_parent(connection):
+    """Alembic's move-and-copy for `batch_alter_table('parent'): drop_column('label')`.
+
+    Hand-written, which is what lets these tests travel and is also their one
+    weakness: it no longer pins that Alembic's batch mode still rebuilds tables
+    this way. The two instantiate-me stubs at the bottom of this file are what
+    pin that.
+    """
+    connection.exec_driver_sql("CREATE TABLE _tmp_parent (id INTEGER PRIMARY KEY)")
+    connection.exec_driver_sql("INSERT INTO _tmp_parent (id) SELECT id FROM parent")
+    connection.exec_driver_sql("DROP TABLE parent")
+    connection.exec_driver_sql("ALTER TABLE _tmp_parent RENAME TO parent")
+    connection.commit()
+
+
+def _row_count(engine, table: str) -> int:
+    with engine.connect() as connection:
+        return connection.exec_driver_sql(f"SELECT count(*) FROM {table}").scalar()
 
 
 def _pooled_connection_count(engine=None) -> int:
@@ -566,6 +655,209 @@ def test_the_baseline_diff_survives_a_rebuild_that_renumbers_constraints(tmp_pat
         "this test proves nothing unless the rebuild actually renumbered the "
         f"constraint ids; before={before} after={after}"
     )
+
+
+def test_the_guard_suspends_enforcement_and_puts_it_back(tmp_path):
+    """Both halves of the guard, on one connection, directly.
+
+    The end-to-end tests either side of this one prove the guard's *effect*
+    through a rebuild. This proves the guard itself, which is what lets the
+    failure be localised when one of them goes red.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "suspends_and_restores.db")
+    try:
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+            with sqlite_foreign_keys_suspended(connection):
+                assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 0
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    finally:
+        engine.dispose()
+
+
+def test_a_suspension_that_did_not_take_is_refused_rather_than_trusted(tmp_path):
+    """ac-01. The OFF is read back too, not just the ON.
+
+    SQLite discards `PRAGMA foreign_keys` inside an open transaction in *both*
+    directions -- which is the whole reason the restore is read back. Issued on a
+    connection that already has one open, the suspension is accepted and dropped,
+    and then every downstream signal says the run was fine: the rebuild ran under
+    enforcement, so `foreign_key_check` is clean, and the restore reads `1`
+    because nothing ever turned it off. The child rows come back stripped and the
+    guard reports success.
+
+    `foreign_key_check` cannot stand in for this. The reference is
+    `ON DELETE SET NULL` over a nullable column, so nulling every child is not a
+    violation -- zero rows, no report. The only way to know the suspension took is
+    to read it back.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "suspension_did_not_take.db")
+    try:
+        with engine.connect() as connection:
+            # A real SQLite transaction, open before the guard is entered.
+            connection.exec_driver_sql(
+                "INSERT INTO parent (id, label) VALUES (2, 'already_writing')"
+            )
+
+            # Not `pytest.raises`: the body has to run so the pragma it sees can
+            # be reported, and "the guard yielded with enforcement at 1" is the
+            # finding.
+            observed = []
+            raised = None
+            try:
+                with sqlite_foreign_keys_suspended(connection):
+                    observed.append(
+                        connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
+                    )
+            except RuntimeError as exc:
+                raised = exc
+
+            assert observed == [], (
+                f"the guard yielded with enforcement still reading {observed}, so a "
+                f"batch rebuild would have run under it and stripped the children"
+            )
+            assert raised is not None and "did not take" in str(raised)
+            # Refused, not half-applied: nothing was suspended, so there is
+            # nothing to restore and the connection is still fit to hand back.
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    finally:
+        engine.dispose()
+
+
+def test_a_clean_run_reports_nothing_and_restores_enforcement(tmp_path):
+    """The other half of the check below: it has to be quiet when nothing is
+    wrong, or it is noise that gets suppressed and then ignored."""
+    engine = _a_schema_built_from_nothing(tmp_path / "clean_run.db")
+    try:
+        with engine.connect() as connection:
+            with sqlite_foreign_keys_suspended(connection):
+                pass
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    finally:
+        engine.dispose()
+
+
+def test_rows_orphaned_while_enforcement_was_off_are_reported(tmp_path):
+    """ac-01. Suspension makes violations possible for the length of the run.
+    This is what stops them also being silent.
+
+    `PRAGMA foreign_key_check` is SQLite's own documented companion to switching
+    enforcement off for a table rebuild, and it is the difference between "a
+    future batch rebuild orphans rows" being a caveat in a docstring and being a
+    message naming the table.
+
+    It is not, however, a backstop for the failure family that produced every
+    round of this defect. `ON DELETE SET NULL` over a nullable column leaves a
+    database `foreign_key_check` calls clean. What this covers is the
+    complementary case: a row left pointing at a parent that is not there, which
+    enforcement would have refused and the suspension admits.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "orphans_reported.db")
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(RuntimeError) as raised:
+                with sqlite_foreign_keys_suspended(connection):
+                    # Accepted only because enforcement is suspended -- which is
+                    # the point: this is what a batch rebuild gone wrong looks
+                    # like.
+                    connection.exec_driver_sql(
+                        "INSERT INTO child (id, label, parent_id) "
+                        "VALUES (2, 'nobody', 987654)"
+                    )
+                    connection.commit()
+
+            assert "child" in str(raised.value), "the report does not name the table"
+            # ...and the pragma is still put back, because the report is about
+            # what happened during the run, not a reason to leave the connection
+            # disarmed.
+            assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    finally:
+        engine.dispose()
+
+
+def test_a_connection_whose_restore_failed_never_goes_back_to_the_pool(tmp_path):
+    """The last path by which enforcement can leak into the pool.
+
+    Reproduces the original defect's mechanism directly rather than by mutation:
+    leaving a transaction open across the exit means SQLite discards the
+    restoring pragma exactly as it did when the guard lived inside the migration.
+    The guard has to notice, say so, and -- because a connection that is not
+    enforcing must never be handed to whoever checks out next -- drop the
+    connection rather than return it.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "restore_failed.db")
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(RuntimeError) as raised:
+                with sqlite_foreign_keys_suspended(connection):
+                    # Opens a real SQLite transaction and leaves it open, which
+                    # is what makes `PRAGMA foreign_keys=ON` a no-op on the way
+                    # out.
+                    connection.exec_driver_sql(
+                        "INSERT INTO parent (id, label) VALUES (2, 'leaks')"
+                    )
+
+            assert "did not take" in str(raised.value)
+            assert connection.invalidated, (
+                "the disarmed connection was handed back to the pool"
+            )
+            # The mechanism is pinned by the line above; this pins what the
+            # operator is actually told. Dropping the sentence left the suite
+            # green, and on this guard a message is a safety mechanism rather
+            # than a nicety.
+            assert "has been discarded" in str(raised.value), (
+                f"the report does not say the connection was discarded: {raised.value}"
+            )
+    finally:
+        engine.dispose()
+
+
+def test_a_violation_the_run_committed_is_reported_even_if_the_restore_fails(tmp_path):
+    """ac-01. The damage that outlives the connection is the damage that matters.
+
+    A batch rebuild commits. So a violation it leaves is on disk, and dropping
+    the connection does not take it back -- unlike the rows still sitting in an
+    open transaction, which `invalidate()` does roll back.
+
+    Those two were once conflated: the check was skipped whenever the restore
+    failed, on the reasoning that the still-open transaction was about to be
+    discarded anyway. That reasoning was measured on an *uncommitted* orphan,
+    where it holds, and shipped as though it held generally. It does not, and the
+    case where it fails is the only one that leaves committed data damaged.
+
+    The check is runnable on this path -- `invalidate()` has not happened yet --
+    so reporting it costs nothing.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "violation_and_failed_restore.db")
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(RuntimeError) as raised:
+                with sqlite_foreign_keys_suspended(connection):
+                    # What a batch rebuild does: orphan a row, and commit it.
+                    connection.exec_driver_sql(
+                        "INSERT INTO child (id, label, parent_id) "
+                        "VALUES (2, 'nobody', 987654)"
+                    )
+                    connection.commit()
+                    # ...and then leave a transaction open, so the restore fails.
+                    connection.exec_driver_sql(
+                        "INSERT INTO parent (id, label) VALUES (2, 'leaks')"
+                    )
+
+        assert "did not take" in str(raised.value), "the failed restore went unreported"
+        assert "child" in str(raised.value), (
+            "the committed violation was dropped: the run reported the failed "
+            "restore and said nothing about the orphan it left on disk"
+        )
+
+        # ...and it really is on disk, so the report was about something real.
+        # The uncommitted `parent` row is not: `invalidate()` rolled it back.
+        assert _row_count(engine, "child") == 2
+        assert _row_count(engine, "parent") == 1
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    finally:
+        engine.dispose()
 
 
 # ---------------------------------------------------------------------------
