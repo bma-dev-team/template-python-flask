@@ -206,6 +206,27 @@ def _guard_run_with_failure_at(index, body, when="before", error=RuntimeError,
                 gc.collect()
     return issued, _statements_sqlite_actually_ran(ran)
 
+def _engine_with_enforcement(path):
+    """A SQLite engine whose connections come up with foreign keys enforced.
+
+    Extracted because every test here needs it and the reason is easy to lose:
+    the guard restores enforcement, it never establishes it. SQLite's default is
+    OFF and this template registers nothing, so without this the guard has
+    nothing to put back and every assertion reads {0, 1}.
+
+    This is the canonical form the SQLITE-FK conventions check asks builds for.
+    """
+    engine = create_engine(f"sqlite:///{path}")
+
+    @sa.event.listens_for(engine, "connect")
+    def _enforce_sqlite_foreign_keys(dbapi_connection, _record):
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+    return engine
+
+
 def _a_schema_built_from_nothing(path):
     """An engine and a seeded parent/child pair, with no app and no migrations.
 
@@ -367,4 +388,181 @@ def test_the_guard_tests_actually_ran():
     assert importlib.util.find_spec("sqlalchemy") is not None, (
         "SQLAlchemy is missing in CI, so every test in this file skipped and the "
         "migration guard shipped unproven. Add it to the CI install step."
+    )
+
+
+def test_the_baseline_diff_survives_a_rebuild_that_renumbers_rowids(tmp_path):
+    """ac-01. The guard must not depend on a property of *this* schema.
+
+    `foreign_key_check` reports `(table, rowid, parent, constraint)`. In this
+    build every `id` is `INTEGER PRIMARY KEY`, which *is* the rowid, so a
+    move-and-copy preserves it and a diff keyed on the whole row happens to work.
+    That is a property of the schema, not of the guard, and this helper is going
+    into the template for builds nobody has looked at yet.
+
+    With a `TEXT PRIMARY KEY` and sparse rowids -- ordinary after any delete --
+    the rebuild renumbers, so a diff keyed on rowid reports every pre-existing
+    orphan as newly created. Every run. It never clears, and `flask bootstrap`
+    calls `upgrade()`, so it is a permanently failing release command.
+
+    The tables here are deliberately not this build's: nothing about the property
+    involves `participant`, and a test bound to `TITLE_REVISION` could not have
+    caught it.
+    """
+    engine = _engine_with_enforcement(tmp_path / "the_baseline_diff_survives_a.db")
+
+    with engine.connect() as connection:
+        connection.exec_driver_sql("CREATE TABLE t_parent (id TEXT PRIMARY KEY)")
+        connection.exec_driver_sql(
+            "CREATE TABLE t_child (id TEXT PRIMARY KEY, "
+            "parent_id TEXT REFERENCES t_parent(id))"
+        )
+        connection.exec_driver_sql("INSERT INTO t_parent (id) VALUES ('p1')")
+        for i in range(1, 6):
+            connection.exec_driver_sql(
+                f"INSERT INTO t_child (id, parent_id) VALUES ('c{i}', 'p1')"
+            )
+        # Sparse rowids, which is what any delete leaves behind.
+        connection.exec_driver_sql("DELETE FROM t_child WHERE id IN ('c1','c2')")
+        connection.commit()
+        # A pre-existing orphan, written the only way one can exist.
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.exec_driver_sql("UPDATE t_child SET parent_id='GONE' WHERE id='c3'")
+        connection.commit()
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        before = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    assert before, "the fixture failed to create a pre-existing violation"
+
+    with engine.connect() as connection:
+        # Alembic's batch rebuild: temp table carrying the constraints, copy,
+        # DROP the original, rename.
+        with sqlite_foreign_keys_suspended(connection):
+            connection.exec_driver_sql(
+                "CREATE TABLE _tmp_t_child (id TEXT PRIMARY KEY, "
+                "parent_id TEXT REFERENCES t_parent(id))"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO _tmp_t_child (id, parent_id) "
+                "SELECT id, parent_id FROM t_child"
+            )
+            connection.exec_driver_sql("DROP TABLE t_child")
+            connection.exec_driver_sql("ALTER TABLE _tmp_t_child RENAME TO t_child")
+            connection.commit()
+
+    # The rebuild renumbered the rowids, and the orphan is the same orphan.
+    with engine.connect() as connection:
+        after = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    assert [row[1] for row in before] != [row[1] for row in after], (
+        "this test proves nothing unless the rebuild actually renumbered the "
+        f"rowids; before={before} after={after}"
+    )
+
+
+def test_a_table_that_is_its_own_parent_survives_its_own_rebuild(tmp_path):
+    """ac-01. The rebuild fires `ON DELETE` against the table being rebuilt.
+
+    Every foreign key in this build points between two tables, so every test here
+    exercises "rebuild A, watch B". A self-parent -- `parent_id` referencing the
+    same table's `id` -- is a different execution shape, not just a different
+    schema: the batch rebuild's implicit `DELETE FROM` fires `ON DELETE CASCADE`
+    against rows *in the table currently being dropped*, mid-rebuild.
+
+    Nothing in this build can produce that, and it is ordinary in the app types
+    this helper is heading towards: categories, org charts, threaded comments,
+    folder trees. Unguarded, dropping the table cascades the whole hierarchy away
+    before the copy is renamed into place.
+    """
+    engine = _engine_with_enforcement(tmp_path / "a_table_that_is_its_own_pare.db")
+
+    with engine.connect() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE node (id INTEGER PRIMARY KEY, label TEXT, "
+            "parent_id INTEGER REFERENCES node(id) ON DELETE CASCADE)"
+        )
+        # root -> child -> grandchild, so a cascade has something to chain through
+        connection.exec_driver_sql("INSERT INTO node (id, label, parent_id) VALUES (1,'root',NULL)")
+        connection.exec_driver_sql("INSERT INTO node (id, label, parent_id) VALUES (2,'child',1)")
+        connection.exec_driver_sql("INSERT INTO node (id, label, parent_id) VALUES (3,'grandchild',2)")
+        connection.commit()
+
+    with engine.connect() as connection:
+        with sqlite_foreign_keys_suspended(connection):
+            # Alembic's batch rebuild of `node`, carrying its own self-reference.
+            connection.exec_driver_sql(
+                "CREATE TABLE _tmp_node (id INTEGER PRIMARY KEY, label TEXT, "
+                "parent_id INTEGER REFERENCES node(id) ON DELETE CASCADE)"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO _tmp_node (id, label, parent_id) "
+                "SELECT id, label, parent_id FROM node"
+            )
+            connection.exec_driver_sql("DROP TABLE node")
+            connection.exec_driver_sql("ALTER TABLE _tmp_node RENAME TO node")
+            connection.commit()
+
+    with engine.connect() as connection:
+        surviving = connection.exec_driver_sql(
+            "SELECT id, label, parent_id FROM node ORDER BY id"
+        ).fetchall()
+    assert [tuple(row) for row in surviving] == [
+        (1, "root", None), (2, "child", 1), (3, "grandchild", 2)
+    ], "the self-referential cascade took the hierarchy with it"
+
+
+def test_the_baseline_diff_survives_a_rebuild_that_renumbers_constraints(tmp_path):
+    """ac-01. The constraint id renumbers too, for the same kind of reason.
+
+    Dropping the rowid from the comparison key fixed one schema dependency and
+    left another in the same tuple. `constraint` is SQLite's `fkid`: an index
+    into `foreign_key_list`, assigned in reverse declaration order and
+    renumbered whenever the list changes. A batch `drop_column` on an FK-bearing
+    column is exactly that -- the surviving foreign keys shuffle down.
+
+    So a pre-existing orphan keyed `('child','pa',1)` becomes `('child','pa',0)`
+    and is reported as newly created: a deploy exiting 1 after the migration has
+    already committed. Narrower than the rowid version because it needs a table
+    with two foreign keys and a migration that drops one, and it self-clears on
+    the next run rather than wedging forever -- but it is the same failure the
+    rowid fix set out to remove, one field along.
+    """
+    engine = _engine_with_enforcement(tmp_path / "the_baseline_diff_survives_a.db")
+
+    with engine.connect() as connection:
+        connection.exec_driver_sql("CREATE TABLE pa (id INTEGER PRIMARY KEY)")
+        connection.exec_driver_sql("CREATE TABLE pb (id INTEGER PRIMARY KEY)")
+        connection.exec_driver_sql(
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, "
+            "a_id INTEGER REFERENCES pa(id), b_id INTEGER REFERENCES pb(id))"
+        )
+        connection.exec_driver_sql("INSERT INTO pa (id) VALUES (1)")
+        connection.exec_driver_sql("INSERT INTO pb (id) VALUES (1)")
+        connection.commit()
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.exec_driver_sql(
+            "INSERT INTO child (id, a_id, b_id) VALUES (1, 999, 1)"
+        )
+        connection.commit()
+        connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+        before = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    assert before, "the fixture failed to create a pre-existing violation"
+
+    with engine.connect() as connection:
+        # `batch_op.drop_column('b_id')`: the `pa` foreign key shuffles down.
+        with sqlite_foreign_keys_suspended(connection):
+            connection.exec_driver_sql(
+                "CREATE TABLE _tmp_child (id INTEGER PRIMARY KEY, "
+                "a_id INTEGER REFERENCES pa(id))"
+            )
+            connection.exec_driver_sql(
+                "INSERT INTO _tmp_child (id, a_id) SELECT id, a_id FROM child"
+            )
+            connection.exec_driver_sql("DROP TABLE child")
+            connection.exec_driver_sql("ALTER TABLE _tmp_child RENAME TO child")
+            connection.commit()
+
+    with engine.connect() as connection:
+        after = connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall()
+    assert [row[3] for row in before] != [row[3] for row in after], (
+        "this test proves nothing unless the rebuild actually renumbered the "
+        f"constraint ids; before={before} after={after}"
     )
