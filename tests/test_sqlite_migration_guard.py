@@ -566,3 +566,61 @@ def test_the_baseline_diff_survives_a_rebuild_that_renumbers_constraints(tmp_pat
         "this test proves nothing unless the rebuild actually renumbered the "
         f"constraint ids; before={before} after={after}"
     )
+
+
+# ---------------------------------------------------------------------------
+# The two proofs that CANNOT be schema-agnostic.
+#
+# Everything above hand-writes the move-and-copy, which is what lets it travel.
+# That is also its one weakness: it no longer pins that Alembic's batch mode
+# still rebuilds tables the way this guard assumes. These two do, and they need
+# a real app, real migrations and a real runner, none of which exist here.
+#
+# They ship as SKIPS with instructions, deliberately, never as code that
+# silently passes. A stub that passes is worse than an absent test: it reports
+# the property as proven.
+# ---------------------------------------------------------------------------
+
+def test_a_guard_failure_stops_a_real_migration_and_says_why():
+    pytest.skip(
+        "INSTANTIATE THIS IN YOUR BUILD. Assert that a RuntimeError raised by "
+        "the guard reaches the operator as a NON-ZERO EXIT through the migration "
+        "runner, not merely that the guard raises. The chain from raise to exit "
+        "code is the thing under test and a direct call cannot stand in for it: "
+        "`flask bootstrap` calls upgrade(), so a guard that raises without "
+        "failing the command leaves a release step that reports success over a "
+        "half-applied migration. Needs: your app factory, your migrations/, and "
+        "an invocation through flask_migrate.upgrade rather than the helper."
+    )
+
+
+def test_a_run_that_rebuilt_a_table_gives_the_connection_back_enforcing():
+    pytest.skip(
+        "INSTANTIATE THIS IN YOUR BUILD. Assert that after a real up/down/up "
+        "across your own revisions -- at least one of which batch-rebuilds a "
+        "foreign-key PARENT -- every connection in the pool comes back with "
+        "PRAGMA foreign_keys = 1. The schema-agnostic tests above check one "
+        "connection they created; this checks the pool the app will actually "
+        "serve from, after the real Alembic batch path rather than a hand-written "
+        "imitation of it. Needs: your app factory, your migrations/, and your "
+        "revision identifiers."
+    )
+
+
+def test_the_two_build_specific_stubs_are_still_here():
+    """The stubs above are the only pointer to what this file cannot prove.
+
+    Deleting a skipped test is invisible in a green suite, and these two are
+    exactly the ones a porter under time pressure deletes: they never pass, they
+    never fail, and they look like unfinished work. They are not. They are the
+    record of the two properties the schema-agnostic tests structurally cannot
+    establish.
+    """
+    here = set(globals())
+    for name in ("test_a_guard_failure_stops_a_real_migration_and_says_why",
+                 "test_a_run_that_rebuilt_a_table_gives_the_connection_back_enforcing"):
+        assert name in here, (
+            f"{name} was removed. It is not unfinished work; it names a property "
+            "this file cannot prove without a real app and real migrations. "
+            "Restore it, or instantiate it in your build and say so here."
+        )
