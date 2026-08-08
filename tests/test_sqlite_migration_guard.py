@@ -15,11 +15,17 @@ can only ever confirm the standard case.
 SQLAlchemy is a test-only dependency here. The guard itself imports nothing but
 the standard library; see app/sqlite_migration_guard.py.
 """
+import ast
 import gc
 import importlib.util
 import logging
 import os
+import pathlib
+import re
+import shutil
 import sqlite3
+import subprocess
+import sys
 from collections import Counter
 
 import pytest
@@ -1525,6 +1531,857 @@ def test_the_detector_reads_main_and_not_an_attached_database(tmp_path):
             )
     finally:
         engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# The source-level layer.
+#
+# Everything above fails SQL statements. It cannot reach a step that issues no
+# SQL: such a step is invisible both to the `exec_driver_sql` shadow and to
+# SQLite's trace callback, so the walk stays green without it. Four such steps
+# were added to this guard across six rounds, each outside the protection the
+# round before had just established, and none of them made a test go red.
+#
+# So this layer reads the guard's source and the suite's own source. It is what
+# turns "we tested the cases we thought of" into "a step you add without a test
+# fails immediately and names itself".
+# ---------------------------------------------------------------------------
+
+# Every operation the guard performs on its connection, and every `raise`, read
+# out of the source rather than listed by hand. Each entry names what covers it.
+#
+# `exec_driver_sql` is the only one the invariant walk can fail; everything else
+# is invisible to it and needs its own test. That distinction was kept as a prose
+# list in the guard module and went stale in a single commit -- a fourth step was
+# added directly beneath a comment saying there were three -- which is why it is
+# derived mechanically now instead.
+GUARD_CONNECTION_OPERATIONS = {
+    # 6 in the guard + 1 in `_database_lives_in_the_connection`, which this walk
+    # follows into. NOTE this is a count of *source occurrences*, while
+    # GUARD_STATEMENTS above counts the statements a *clean run* executes. They
+    # differ by one on purpose: the `database_list` pragma runs only when the
+    # restore failed. A new statement on the clean path bumps both; one on a
+    # failure path bumps only this.
+    # covered by test_the_invariant_holds_on_a_schema_the_guard_has_never_seen
+    "exec_driver_sql": 7,
+    # covered by test_offline_mode_is_a_no_op
+    "hasattr": 1,
+    # covered by test_a_failed_in_memory_check_is_reported_and_not_swallowed
+    "_database_lives_in_the_connection": 1,
+    # covered by test_a_discard_that_cannot_happen_is_reported_not_raised
+    "invalidate": 1,
+}
+GUARD_RAISE_STATEMENTS = 4
+
+
+def _dotted_root(node):
+    """(root Name id, dotted path) for an attribute chain, or (None, None).
+
+    Unwraps a walrus on the way down, so `(c := connection).rollback()` resolves
+    to the same root as `connection.rollback()`.
+    """
+    parts = []
+    while True:
+        if isinstance(node, ast.Attribute):
+            parts.append(node.attr)
+            node = node.value
+        elif isinstance(node, ast.NamedExpr):
+            node = node.value
+        else:
+            break
+    if isinstance(node, ast.Name):
+        return node.id, ".".join(reversed(parts))
+    return None, None
+
+
+def _operations_in(source, function_name):
+    """Operations on `connection`, and raise-count, for one function in `source`.
+
+    Split out from the guard-specific caller so it can be pointed at a fixture
+    module -- `test_the_walk_sees_every_alias_shape_it_claims_to` exercises each
+    shape below against a source it writes itself. Before that existed, reverting
+    this entire function to its pre-alias form reproduced the originating suite's
+    baseline exactly: the measurements were in a report, not in the suite.
+
+    Detects, each measured against that fixture:
+
+    * a direct call, and an attribute *chain* -- `connection.connection.
+      dbapi_connection.setconfig(...)`;
+    * a **bound method held in a name**, which is that same `setconfig` disarm;
+    * aliases via plain assignment, walrus, conditional, tuple-unpack,
+      `with ... as`, `for ... in`, and a default argument;
+    * the connection passed as a positional, keyword, `*args` or `**kwargs`
+      argument, or as a bound method (`f(connection.rollback)`);
+    * closures, lambdas and nested functions, which `ast.walk` descends into;
+    * module-level helpers the connection is handed to, followed into.
+
+    Argument detection is a subtree scan: any alias appearing anywhere inside a
+    call's arguments counts. That over-detects rather than under-detects, which
+    is the right direction for a tripwire.
+
+    Still blind, and this list is the one that has been wrong twice: a connection
+    stored in a container or on an attribute (`self.conn = connection`), returned
+    from a function, or reached through `globals()`. Each needs dataflow this
+    does not attempt. Treat the list as "known blind", not "exhaustively blind".
+    """
+    module = ast.parse(source)
+    module_functions = {
+        node.name: node for node in module.body if isinstance(node, ast.FunctionDef)
+    }
+    operations = Counter()
+    raises = 0
+    seen = set()
+
+    def analyse(function, connection_param):
+        nonlocal raises
+        if (function.name, connection_param) in seen:
+            return
+        seen.add((function.name, connection_param))
+
+        aliases = {connection_param: ""}
+
+        def bind(target, value):
+            if isinstance(value, ast.IfExp):
+                bind(target, value.body)
+                bind(target, value.orelse)
+                return
+            root, path = _dotted_root(value)
+            if root not in aliases:
+                return
+            joined = ".".join(part for part in (aliases[root], path) if part)
+            if isinstance(target, ast.Name):
+                aliases[target.id] = joined
+
+        def mentions_alias(node, descend_into_calls=True):
+            """Does an alias appear here?
+
+            `descend_into_calls=False` for argument scanning: in
+            `bool(connection.exec_driver_sql(...))` the connection belongs to the
+            inner call, which is recorded on its own, so `bool` is not counted.
+
+            Measured, because an earlier version of this paragraph asserted the
+            opposite and was wrong in both of its claims:
+
+            * `bool(connection.exec_driver_sql("x"))` records **both** `bool` and
+              `exec_driver_sql`. The skip applies to *child* Call nodes, and here
+              the argument is itself the Call, so its `func` is still walked.
+            * `outer(inner(connection))` records **both** wrappers.
+            * At three levels, `outer(mid(inner(connection)))`, one wrapper is
+              lost -- but the connection is still seen, so the call is not
+              missed, only its outermost frame.
+
+            So this over-detects at one and two levels and loses a frame at
+            three. It has never been shown to miss a connection entirely through
+            wrapping. The three cases are pinned in `WALK_SHAPES_SEEN`.
+            """
+            stack = [node]
+            while stack:
+                current = stack.pop()
+                if isinstance(current, ast.Name) and current.id in aliases:
+                    return True
+                for child in ast.iter_child_nodes(current):
+                    if not descend_into_calls and isinstance(child, ast.Call):
+                        continue
+                    stack.append(child)
+            return False
+
+        for _ in range(4):  # settle chained bindings
+            for node in ast.walk(function):
+                if isinstance(node, ast.NamedExpr):
+                    bind(node.target, node.value)
+                elif isinstance(node, ast.Assign):
+                    for target in node.targets:
+                        if isinstance(target, ast.Tuple) and isinstance(node.value, ast.Tuple):
+                            for element, value in zip(target.elts, node.value.elts):
+                                bind(element, value)
+                        else:
+                            bind(target, node.value)
+                elif isinstance(node, (ast.AnnAssign, ast.AugAssign)) and node.value:
+                    bind(node.target, node.value)
+                elif isinstance(node, (ast.With, ast.AsyncWith)):
+                    for item in node.items:
+                        if item.optional_vars is not None:
+                            bind(item.optional_vars, item.context_expr)
+                elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                    # Conservative: if the iterable mentions the connection at
+                    # all, the loop variable may be it.
+                    if mentions_alias(node.iter) and isinstance(node.target, ast.Name):
+                        aliases.setdefault(node.target.id, "")
+                elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                    # `def inner(c=connection)` binds `c` inside `inner`.
+                    arguments = node.args
+                    positional = arguments.posonlyargs + arguments.args
+                    for argument, default in zip(
+                        positional[len(positional) - len(arguments.defaults):],
+                        arguments.defaults,
+                    ):
+                        bind(ast.Name(id=argument.arg, ctx=ast.Store()), default)
+
+        for node in ast.walk(function):
+            if isinstance(node, ast.Raise):
+                raises += 1
+            elif isinstance(node, ast.Call):
+                root, path = _dotted_root(node.func)
+                if root in aliases:
+                    joined = ".".join(part for part in (aliases[root], path) if part)
+                    if joined:
+                        operations[joined] += 1
+                        continue
+                # Any alias anywhere in the arguments, however it is spelled:
+                # positional, keyword, *args, **kwargs, or a bound method.
+                carriers = [a for a in node.args if mentions_alias(a, False)]
+                carriers += [
+                    k for k in node.keywords if mentions_alias(k.value, False)
+                ]
+                if not carriers:
+                    continue
+                name = getattr(node.func, "id", getattr(node.func, "attr", "?"))
+                operations[name] += 1
+
+                target = module_functions.get(name)
+                if target is None:
+                    continue
+                names = [a.arg for a in target.args.posonlyargs + target.args.args]
+                inner = None
+                for keyword in node.keywords:
+                    if keyword.arg and mentions_alias(keyword.value, False):
+                        inner = keyword.arg
+                        break
+                if inner is None:
+                    for index, argument in enumerate(node.args):
+                        # A Starred consumes an unknown number of positions, so
+                        # the mapping stops being sound; record and do not recurse.
+                        if isinstance(argument, ast.Starred):
+                            break
+                        if mentions_alias(argument, False) and index < len(names):
+                            inner = names[index]
+                            break
+                if inner is not None:
+                    analyse(target, inner)
+
+    analyse(module_functions[function_name], "connection")
+    return operations, raises
+
+
+def _guard_operations_from_source():
+    """`_operations_in`, pointed at the guard."""
+    return _operations_in(
+        pathlib.Path(guard.__file__).read_text(),
+        "sqlite_foreign_keys_suspended",
+    )
+
+
+def test_every_step_the_guard_takes_is_accounted_for():
+    """ac-01. The list of fallible steps is derived from the code, not maintained.
+
+    The invariant walk fails SQL statements. It cannot reach anything else: a
+    step that issues no SQL is invisible both to the `exec_driver_sql` shadow and
+    to SQLite's trace callback, so the walk stays green without it. Four such
+    steps were added to this guard across six rounds, each outside the protection
+    the round before had just established, and none of them made a test go red.
+
+    The list of them lived in a comment. It went stale in one commit -- a fourth
+    step added directly below a comment reading "There are three, and each has
+    one" -- which is the evidence that a hand-maintained list does not work here.
+    So the list is read out of the source. Add an operation on `connection`, or a
+    `raise`, and this test fails and sends you to write its cover.
+
+    It deliberately asserts the whole mapping rather than a total, so the failure
+    names the thing you added instead of a number that moved.
+    """
+    operations, raises = _guard_operations_from_source()
+
+    assert dict(operations) == GUARD_CONNECTION_OPERATIONS, (
+        "the guard's operations on its connection changed.\n"
+        f"  found:    {dict(operations)}\n"
+        f"  expected: {GUARD_CONNECTION_OPERATIONS}\n"
+        "If you added an `exec_driver_sql` that runs on a clean pass, the "
+        "invariant walk covers it -- bump this count AND GUARD_STATEMENTS. If it "
+        "runs only on a failure path, bump this one only; the two count "
+        "different things. If you added anything else, the walk CANNOT cover it "
+        "and you owe it a dedicated test; add the entry here with that test's "
+        "name beside it, and check the annotation is true -- "
+        "test_the_coverage_annotations_are_true will."
+    )
+    assert raises == GUARD_RAISE_STATEMENTS, (
+        f"the guard has {raises} raise statements, not {GUARD_RAISE_STATEMENTS}. "
+        "A raise is control flow the walk cannot exercise: whichever one you "
+        "added or removed needs a test that shows it reaching the caller."
+    )
+
+
+# Each guard step, an edit that breaks it, and the test annotated as covering it.
+# The annotations on GUARD_CONNECTION_OPERATIONS are claims, and a claim on this
+# guard has outlived the thing it described more than once --
+# `_database_lives_in_the_connection` was annotated as covered by two tests,
+# neither of which exercised its failure.
+#
+# Keyed by the same names as GUARD_CONNECTION_OPERATIONS, and the two are
+# asserted equal below. An earlier version of this comment claimed a step added
+# to the mapping without a probe here "is a KeyError, not a silent omission" --
+# nothing iterated one against the other, so it was silently unprobed. Measured:
+# new guard step + mapping entry + no probe = 5 passed.
+COVERAGE_PROBES = {
+    "exec_driver_sql": (
+        '        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")\n'
+        '        if connection.exec_driver_sql("PRAGMA foreign_keys").scalar():',
+        '        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")\n'
+        '        if False:',
+        "test_a_suspension_that_did_not_take_is_refused_rather_than_trusted",
+    ),
+    "hasattr": (
+        '    if connection is None or not hasattr(connection, "exec_driver_sql"):',
+        "    if connection is None:",
+        "test_offline_mode_is_a_no_op",
+    ),
+    "_database_lives_in_the_connection": (
+        "                if not isinstance(exc, Exception) and interrupt is None:\n"
+        "                    interrupt = exc",
+        "                pass",
+        "test_a_failed_in_memory_check_is_reported_and_not_swallowed",
+    ),
+    "invalidate": (
+        "                try:\n                    connection.invalidate()\n"
+        "                except BaseException as exc:",
+        "                connection.invalidate()\n                if False:\n"
+        "                  try: pass\n                  except BaseException as exc:",
+        "test_a_discard_that_cannot_happen_is_reported_not_raised",
+    ),
+}
+
+
+def test_every_guard_step_has_a_coverage_probe():
+    """ac-01. The probe table is complete, and -- crucially -- not empty.
+
+    `test_the_coverage_annotations_are_true` is parametrized over
+    `COVERAGE_PROBES`, so **emptying that table deletes the mechanism into
+    green**: pytest emits one "got empty parameter set" skip among the other
+    skips and reports zero failures.
+
+    That is not a hypothetical, and this port is exactly the moment it was
+    predicted for: on arrival all four probes name tests from the originating
+    build, and the mutation strings have to match a guard that moved modules.
+    Emptying the table is the cheapest way to make CI green, and nothing would
+    have told the porter what they had just switched off.
+
+    So the check that the table is populated lives outside the parametrization,
+    where clearing the table cannot skip it.
+    """
+    assert COVERAGE_PROBES, (
+        "COVERAGE_PROBES is empty, which silently disables "
+        "test_the_coverage_annotations_are_true -- the mechanism that verifies "
+        "every `# covered by` annotation on GUARD_CONNECTION_OPERATIONS is true. "
+        "If the probes broke during a port, re-point them at the renamed tests; "
+        "do not clear them."
+    )
+    missing = set(GUARD_CONNECTION_OPERATIONS) - set(COVERAGE_PROBES)
+    dangling = set(COVERAGE_PROBES) - set(GUARD_CONNECTION_OPERATIONS)
+    assert not missing and not dangling, (
+        f"every guard step needs a probe and vice versa; unprobed steps: "
+        f"{sorted(missing)}; probes for steps that no longer exist: "
+        f"{sorted(dangling)}"
+    )
+
+
+@pytest.mark.parametrize("step", sorted(COVERAGE_PROBES))
+def test_the_coverage_annotations_are_true(step, tmp_path):
+    """ac-01. Each `# covered by` annotation, checked by breaking the step.
+
+    The recurring failure on this guard has been a claim outliving the thing it
+    described. The step *list* is now derived from the source, which closed that
+    for the list itself -- and moved the last hand-maintained claim into the
+    annotations beside it, where an entry promptly vouched for coverage that did
+    not exist.
+
+    So the annotations are executed rather than trusted: break the step, run the
+    named test in a subprocess against the broken source, and require it to fail.
+    A `# covered by` that names a test which passes anyway is caught here.
+
+    The mutation is applied to a *copy* of the tree, never to the working file,
+    so an interrupted run cannot leave the guard modified -- a real hazard, hit
+    once already.
+
+    The named test is run twice: once unmutated, which must pass, and once
+    mutated, which must fail. The baseline is what makes the mutation the cause
+    rather than a coincidence.
+
+    **What this still does not establish**, stated because the annotation reads
+    stronger than it is: that the mutation damages *this* step specifically. One
+    broad enough to break several tests will satisfy several probes. The `before`
+    strings are step-local, so mis-wiring has to be deliberate -- but the check
+    is "this test is sensitive to this edit", not "this test is the reason this
+    step is safe".
+    """
+    before, after, test_name = COVERAGE_PROBES[step]
+
+    root = pathlib.Path(guard.__file__).parents[1]
+    sandbox = tmp_path / "tree"
+    shutil.copytree(root, sandbox, ignore=shutil.ignore_patterns(
+        # A denylist, so it is wrong by default in a tree that is not this one.
+        # Cheap in a bare template and not cheap in a build with a `.venv`, which
+        # is why the near-misses are listed rather than assumed absent.
+        "__pycache__", "*.pyc", ".git", "venv", ".venv", "env", ".tox",
+        ".pytest_cache", ".mypy_cache", "node_modules", "instance", "*.egg-info",
+    ))
+    guard_copy = sandbox / "app" / "sqlite_migration_guard.py"
+    source = guard_copy.read_text()
+    assert before in source, f"the probe for {step!r} no longer matches the guard"
+    mutated = source.replace(before, after, 1)
+    # The mutation has to be a real change to real code, not a way of breaking
+    # the module. A mutation that does not parse makes every test in the sandbox
+    # error on import, which reads as "the named test failed" to any check that
+    # only asks whether pytest was unhappy.
+    try:
+        ast.parse(mutated)
+    except SyntaxError as exc:
+        pytest.fail(
+            f"the probe for {step!r} produces source that does not parse "
+            f"({exc.msg} at line {exc.lineno}). A mutation must be a real change "
+            f"to real code: one that does not parse makes every test in the "
+            f"sandbox error on import, which is not evidence of anything."
+        )
+
+    def run_named_test():
+        return subprocess.run(
+            [sys.executable, "-m", "pytest",
+             f"tests/test_sqlite_migration_guard.py::{test_name}",
+             "-x", "-q", "--no-header", "-p", "no:cacheprovider"],
+            cwd=sandbox, capture_output=True, text=True, timeout=300,
+        )
+
+    # Baseline first, on the UNMUTATED copy. Without it a probe certifies
+    # "covered" for a test that was already failing, or for one that fails for a
+    # reason unrelated to the step -- the mutation has to be what changed the
+    # verdict, not merely coincide with a red result.
+    guard_copy.write_text(source)
+    baseline = run_named_test()
+    assert baseline.returncode == 0, (
+        f"{test_name} does not pass on unmutated source (exit "
+        f"{baseline.returncode}), so its failure under the probe for {step!r} "
+        f"would prove nothing.\n{baseline.stdout[-1000:]}"
+    )
+
+    guard_copy.write_text(mutated)
+    finished = run_named_test()
+    # EXACTLY 1 (pytest's TESTS_FAILED), not merely nonzero. pytest exits 4 when
+    # it collects nothing, so `!= 0` accepts a probe naming a test that does not
+    # exist -- after a rename, a typo, or a test not carried across in a port.
+    # Both were demonstrated passing. Exit 1 alone is not enough either: a
+    # mutation that breaks a *fixture* also exits 1, with the test body never
+    # entered, so the probe would certify "covered" on zero executed assertions.
+    # pytest's summary distinguishes them, so require a genuine failure and no
+    # errors.
+    failed = re.search(r"(\d+) failed", finished.stdout)
+    errored = re.search(r"(\d+) error", finished.stdout)
+    if finished.returncode == 4:
+        hint = ("nothing was collected -- the test may have been renamed or "
+                "removed, or the module or its conftest failed to import")
+    elif errored:
+        hint = (f"{errored.group(1)} error(s) and no failure -- the mutation "
+                f"broke a fixture or import, so the test body never ran")
+    else:
+        hint = "expected exactly 1 (pytest TESTS_FAILED)"
+    assert finished.returncode == 1 and failed and not errored, (
+        f"{step!r} is annotated as covered by {test_name}, but breaking it did "
+        f"not make that test fail. pytest exited {finished.returncode}: {hint}."
+        f"\n{finished.stdout[-1500:]}"
+    )
+
+
+WALK_SHAPES_SEEN = {
+    "direct call": "    connection.rollback()",
+    "attribute chain": "    connection.connection.dbapi_connection.setconfig(1, False)",
+    "bound method in a name": (
+        "    _s = connection.connection.dbapi_connection.setconfig\n"
+        "    _s(1, False)"
+    ),
+    "plain alias": "    _c = connection\n    _c.rollback()",
+    "walrus": "    (_c := connection).rollback()",
+    "conditional alias": "    _c = connection if True else None\n    _c.rollback()",
+    "tuple unpack": "    _a, _b = connection, 1\n    _a.rollback()",
+    "with ... as": "    with connection as _c:\n        _c.rollback()",
+    "for target": "    for _c in (connection,):\n        _c.rollback()",
+    "positional argument": "    _helper(connection)",
+    "keyword argument": "    _helper(conn=connection)",
+    "star args": "    _helper(*[connection])",
+    "double star": '    _helper(**{"conn": connection})',
+    "bound method as argument": "    _helper(connection.rollback)",
+    "default argument": (
+        "    def _inner(c=connection):\n        c.rollback()\n    _inner()"
+    ),
+    "closure": "    def _inner():\n        connection.rollback()\n    _inner()",
+    "lambda": "    _f = lambda: connection.rollback()\n    _f()",
+    # The three wrapping depths, measured rather than reasoned about.
+    "wrapped once": '    bool(connection.exec_driver_sql("x"))',
+    "wrapped twice": "    _helper(_helper(connection))",
+    "wrapped three deep": "    _helper(_helper(_helper(connection)))",
+}
+
+# Shapes the analysis is documented as NOT seeing. Asserted too, so the blind
+# list stays honest: a shape that quietly starts working should update the
+# docstring rather than sit there making it wrong in the other direction.
+WALK_SHAPES_BLIND = {
+    "container": "    _box = [connection]\n    _box[0].rollback()",
+    "return value": (
+        "    def _fetch():\n        return connection\n    _fetch().rollback()"
+    ),
+    "globals": (
+        "    globals()['_g'] = connection\n    globals()['_g'].rollback()"
+    ),
+    "attribute store": (
+        "    class _H:\n        pass\n    _h = _H()\n    _h.c = connection\n"
+        "    _h.c.rollback()"
+    ),
+}
+
+# Shapes whose detection depends on following into a module-level helper. They
+# must record what the helper does, not merely the call to it: asserting only
+# that *something* was found let the recursion be deleted with every shape still
+# passing.
+SHAPES_THAT_FOLLOW_INTO_THE_HELPER = frozenset({
+    "positional argument", "keyword argument", "bound method as argument",
+})
+
+
+def _fixture_module(body):
+    # `_helper` touches its connection so the recursion has something to find.
+    # That alone does NOT exercise "followed into": deleting the recursion still
+    # leaves every shape passing, because the call to `_helper` is itself
+    # recorded. What exercises it is asserting the helper's *contents* appear --
+    # see SHAPES_THAT_FOLLOW_INTO_THE_HELPER above.
+    return (
+        "def _helper(conn=None, *args, **kwargs):\n    conn.rollback()\n\n\n"
+        "def guard(connection):\n" + body + "\n"
+    )
+
+
+@pytest.mark.parametrize("shape", sorted(WALK_SHAPES_SEEN))
+def test_the_walk_sees_every_alias_shape_it_claims_to(shape):
+    """ac-01. The walk's detection, pinned against a source written here.
+
+    Reverting the entire alias/chain/starred/walrus work reproduced the
+    originating suite's baseline exactly, because every measurement behind it
+    lived in a report rather than in a test. This guard is a template asset; the
+    next person to simplify `_operations_in` would silently lose the
+    bound-method-alias detection that work exists to add, and the suite would
+    agree with them.
+
+    A fixture module rather than the guard itself, because the point is the
+    *analysis*, not any one build's code, and because shapes the guard does not
+    currently contain are exactly the ones that need holding.
+    """
+    operations, _raises = _operations_in(
+        _fixture_module(WALK_SHAPES_SEEN[shape]), "guard"
+    )
+    assert operations, (
+        f"the walk saw nothing for {shape!r}, so a step written that way could "
+        f"be added to the guard with every test staying green:\n"
+        f"{WALK_SHAPES_SEEN[shape]}"
+    )
+    if shape in SHAPES_THAT_FOLLOW_INTO_THE_HELPER:
+        # `rollback` is what `_helper` does. Requiring it means the recursion
+        # actually ran; requiring only a non-empty result would pass on the
+        # recorded call to `_helper` itself, with the recursion deleted.
+        assert "rollback" in operations, (
+            f"{shape!r} recorded {dict(operations)} but not the helper's own "
+            f"operation, so the connection was seen arriving at `_helper` and "
+            f"the walk never followed it in"
+        )
+
+
+@pytest.mark.parametrize("shape", sorted(WALK_SHAPES_BLIND))
+def test_the_walk_is_blind_to_exactly_what_it_says_it_is(shape):
+    """ac-01. The blind list, asserted in the blind direction.
+
+    Twice now this list has been wrong -- once claiming closures were invisible
+    when they are seen, once omitting the bound-method alias that is the walk's
+    own reason for existing. A list of limitations is a claim like any other, so
+    the documented blind spots are measured blind here. If one of these starts
+    being detected, this goes red and the docstring gets corrected rather than
+    quietly overstating the gap.
+    """
+    operations, _raises = _operations_in(
+        _fixture_module(WALK_SHAPES_BLIND[shape]), "guard"
+    )
+    assert not operations, (
+        f"{shape!r} is documented as invisible to the walk but was detected "
+        f"({dict(operations)}); update the docstring's blind list"
+    )
+
+
+# ---------------------------------------------------------------------------
+# The keystone.
+#
+# Every mechanism in this file has, at some point, been deletable into green:
+# emptying a parametrized table turns its tests into skips, and a skip is not a
+# colour anyone reacts to. Guard-rails must sit outside the structure they guard.
+#
+# What this buys, stated honestly because the alternative is another round of the
+# same: you cannot write a suite that cannot be deleted. A determined porter can
+# remove the keystone and its own entry below together. What the keystone does is
+# make every path to green a deliberate edit to a test that says what it
+# protects, rather than a cleanup that looks like tidying.
+#
+# Anything past that belongs in docs/porting-the-sqlite-migration-guard.md, where
+# a human reads it -- not in another guard-rail.
+# ---------------------------------------------------------------------------
+
+REQUIRED_META_TESTS = frozenset({
+    # The keystone names itself, so deleting it is the one deletion that cannot
+    # be silent -- it has to be removed from this list in the same edit.
+    "test_the_suite_still_has_its_keystone",
+    "test_every_guard_step_has_a_coverage_probe",
+    "test_the_coverage_annotations_are_true",
+    "test_every_step_the_guard_takes_is_accounted_for",
+    "test_the_walk_sees_every_alias_shape_it_claims_to",
+    "test_the_walk_is_blind_to_exactly_what_it_says_it_is",
+    # These three are this file's, not the originating build's. They hold the
+    # port itself honest: that the renames are recorded, that the two
+    # instantiate-me stubs were not deleted for tidiness, and that the whole
+    # module did not skip on a missing dependency.
+    "test_every_rename_points_at_a_test_that_exists",
+    "test_the_two_build_specific_stubs_are_still_here",
+    "test_the_guard_tests_actually_ran",
+})
+
+# Entries whose removal would otherwise be invisible: non-emptiness alone does
+# not stop a table being hollowed out one key at a time, and the bound-method
+# alias is the shape the walk exists for. The `file:...uri=true` URL form is the
+# one a `url.database` check misses, which is the whole reason that table has
+# four entries rather than two.
+REQUIRED_BLIND_SHAPES = frozenset({
+    "container", "attribute store", "return value", "globals",
+})
+REQUIRED_MEMORY_URLS = frozenset({
+    "sqlite://", "sqlite:///:memory:", "sqlite:///",
+    "sqlite:///file:shared_mem?mode=memory&cache=shared&uri=true",
+})
+REQUIRED_WALK_SHAPES = frozenset({
+    "bound method in a name", "attribute chain", "plain alias", "with ... as",
+    "default argument", "double star", "closure",
+})
+# A floor on the discovered meta tests, so gutting REQUIRED_META_TESTS is caught
+# by something that is not itself a hand-maintained list. Measured against this
+# file rather than inherited: the originating suite's floor was 6 and counted
+# tests that did not travel.
+MINIMUM_META_TESTS = 5
+
+
+def _tables_the_suite_parametrizes_over(module):
+    """Module-level names any `pytest.mark.parametrize` draws its values from.
+
+    Discovered rather than listed, so a table added later is covered without
+    anyone remembering to come here -- which is exactly what did not happen the
+    last three times a table was added.
+    """
+    module_level = set()
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            module_level.update(t.id for t in node.targets if isinstance(t, ast.Name))
+        # `TABLE: dict = {...}` is as idiomatic as the bare form and was a hole.
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            module_level.add(node.target.id)
+    found = set()
+    for node in ast.walk(module):
+        if not isinstance(node, ast.Call):
+            continue
+        if _dotted_root(node.func)[1] != "mark.parametrize":
+            continue
+        # Positional `parametrize("x", TABLE)` and keyword `argvalues=TABLE`
+        # are both idiomatic; reading only the first was a hole.
+        sources = list(node.args[1:2])
+        sources += [k.value for k in node.keywords if k.arg == "argvalues"]
+        for source in sources:
+            for inner in ast.walk(source):
+                if isinstance(inner, ast.Name) and inner.id in module_level:
+                    found.add(inner.id)
+    return found
+
+
+def _module_level_collections(module):
+    """Every ALL_CAPS module-level collection, whether parametrized over or not.
+
+    The keystone's own `REQUIRED_*` frozensets are invisible to the
+    parametrize-based discovery because nothing parametrizes over them --
+    emptying either left the originating suite green with two of the keystone's
+    three assertions silently switched off. Discovering by naming convention
+    covers them, and covers the next one nobody remembers to add.
+    """
+    collections = set()
+    for node in module.body:
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            targets, value = [node.target], node.value
+        else:
+            continue
+        literal = isinstance(value, (ast.Dict, ast.List, ast.Set, ast.Tuple)) or (
+            isinstance(value, ast.Call)
+            and getattr(value.func, "id", None) in ("frozenset", "set", "dict", "list")
+        )
+        if not literal:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name) and re.fullmatch(r"_?[A-Z][A-Z0-9_]*", target.id):
+                collections.add(target.id)
+    return collections
+
+
+def _meta_tests_in(module):
+    """Test functions that inspect the suite's or the guard's own source.
+
+    Discovered rather than listed: a test counts as meta if it, or a
+    module-level helper it calls, touches `__file__` or the `ast`/`tokenize`
+    machinery. Used only as a floor -- deletion shrinks both the derived set and
+    the module, so derivation alone cannot catch it, which is why
+    `REQUIRED_META_TESTS` still names them.
+    """
+    helpers = {
+        node.name: node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_")
+    }
+
+    def inspects_source(function, depth=0):
+        if depth > 3:
+            return False
+        for node in ast.walk(function):
+            if isinstance(node, ast.Name) and node.id == "__file__":
+                return True
+            if isinstance(node, ast.Call):
+                root, path = _dotted_root(node.func)
+                if root in ("ast", "tokenize"):
+                    return True
+                callee = getattr(node.func, "id", None)
+                if callee in helpers and inspects_source(helpers[callee], depth + 1):
+                    return True
+        return False
+
+    return {
+        node.name for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("test_")
+        and inspects_source(node)
+    }
+
+
+def test_the_suite_still_has_its_keystone():
+    """ac-01. The one test that notices the others going missing.
+
+    Three separate things here, and each closes a way this suite has actually
+    been made green by deletion:
+
+    1. **Every parametrized table is non-empty.** Emptying one is reported by
+       pytest as "got empty parameter set" -- a *skip*, and a skip is not a
+       colour anyone reacts to.
+    2. **Every meta test still exists, and asserts something.** The source-level
+       layer could be removed in one edit, and a named test stubbed to `pass`
+       keeps its name while dropping its coverage.
+    3. **The shape tables keep their load-bearing keys**, since a table can be
+       hollowed out one entry at a time without ever being empty.
+
+    It cannot stop a determined edit, and the boundary is stated rather than
+    guessed: deleting any meta test is caught here, and deleting *this* test
+    together with its own entry above is green. No arrangement of tests inside
+    one file prevents that, which is why the port checklist -- read by a human --
+    is the backstop rather than another guard-rail.
+    """
+    module = ast.parse(pathlib.Path(__file__).read_text())
+    defined = {
+        node.name for node in module.body if isinstance(node, ast.FunctionDef)
+    }
+    here = sys.modules[__name__]
+
+    missing = sorted(REQUIRED_META_TESTS - defined)
+    assert not missing, (
+        f"meta tests have been removed from this module: {missing}. These are "
+        f"the checks that hold the guard's own machinery honest -- the walk, the "
+        f"coverage annotations, the renames, the two instantiate-me stubs. If "
+        f"they broke during a port, re-point them; deleting them removes the "
+        f"only evidence that any of this works."
+    )
+
+    # A named test can exist and assert nothing: stubbing one to `pass` leaves
+    # the suite green with its name still vouching for it.
+    #
+    # Two shapes, because checking only for the PRESENCE of an assert was not
+    # enough. Measured while mutating this suite: inserting `return` as the first
+    # statement of a meta test leaves every assert in the AST, unreachable, and
+    # this check passed while the test ran nothing. Both an empty body and an
+    # unconditional early exit are hollow, and the second is the one that looks
+    # like a debugging line somebody forgot to take out.
+    #
+    # "Unconditional" is load-bearing: `test_the_guard_tests_actually_ran` skips
+    # on purpose when CI is unset, and that skip sits inside an `if`, so it is
+    # not flagged. Only a top-level exit ahead of the first assert is.
+    bodies = {
+        node.name: node for node in module.body
+        if isinstance(node, ast.FunctionDef) and node.name in REQUIRED_META_TESTS
+    }
+
+    def exits_before_asserting(node):
+        for statement in node.body:
+            if any(isinstance(inner, ast.Assert) for inner in ast.walk(statement)):
+                return False
+            if isinstance(statement, ast.Return):
+                return True
+            if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+                if _dotted_root(statement.value.func)[1] == "skip":
+                    return True
+        return False
+
+    hollow = sorted(
+        name for name, node in bodies.items()
+        if not any(isinstance(inner, ast.Assert) for inner in ast.walk(node))
+        or exits_before_asserting(node)
+    )
+    assert not hollow, (
+        f"these meta tests exist but assert nothing: {hollow}. An empty body, or "
+        f"an unconditional `return`/`pytest.skip` above the assertions, keeps the "
+        f"name and drops the coverage -- which is worse than deleting the test, "
+        f"because the suite still claims it."
+    )
+
+    # Every ALL_CAPS module-level collection, not only the parametrized ones --
+    # the REQUIRED_* frozensets are invisible to the parametrize-based discovery,
+    # and emptying either switches off a keystone assertion silently.
+    emptied = sorted(
+        name for name in _module_level_collections(module)
+        if not getattr(here, name, None)
+    )
+    assert not emptied, (
+        f"module-level tables are empty: {emptied}. For a parametrized table "
+        f"pytest turns that into a skip, so its tests vanish silently; for a "
+        f"REQUIRED_* set it switches off the assertion that reads it. "
+        f"Repopulate rather than clear."
+    )
+
+    tables = _tables_the_suite_parametrizes_over(module)
+    assert tables, (
+        "no parametrized tables were discovered, which means this discovery has "
+        "broken rather than that the suite has none"
+    )
+
+    discovered_meta = _meta_tests_in(module)
+    assert len(discovered_meta) >= MINIMUM_META_TESTS, (
+        f"only {len(discovered_meta)} source-inspecting tests remain "
+        f"({sorted(discovered_meta)}), below the floor of {MINIMUM_META_TESTS}. "
+        f"This floor is derived from the module rather than from a list, so it "
+        f"still holds when REQUIRED_META_TESTS is the thing that was gutted."
+    )
+
+    for label, required, table in (
+        ("WALK_SHAPES_SEEN", REQUIRED_WALK_SHAPES, WALK_SHAPES_SEEN),
+        ("WALK_SHAPES_BLIND", REQUIRED_BLIND_SHAPES, WALK_SHAPES_BLIND),
+        ("DATABASES_THAT_DIE_WITH_THE_CONNECTION", REQUIRED_MEMORY_URLS,
+         set(DATABASES_THAT_DIE_WITH_THE_CONNECTION)),
+    ):
+        lost = sorted(required - set(table))
+        assert not lost, (
+            f"{label} has lost entries it is specifically held to: {lost}. A "
+            f"table can be hollowed out one key at a time without ever being "
+            f"empty -- 'bound method in a name' is the shape the walk exists "
+            f"for, and the `file:...uri=true` URL is the one a `url.database` "
+            f"check misses."
+        )
 
 
 # ---------------------------------------------------------------------------
