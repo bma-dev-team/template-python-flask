@@ -30,8 +30,8 @@ sa = pytest.importorskip(
            "CI installs it. If this skips in CI the guard is unproven, which is "
            "worse than absent -- see test_the_guard_tests_actually_ran.",
 )
-from sqlalchemy import create_engine          # noqa: E402
-from sqlalchemy.pool import StaticPool        # noqa: E402
+from sqlalchemy import create_engine, create_mock_engine   # noqa: E402
+from sqlalchemy.pool import StaticPool                     # noqa: E402
 
 import app.sqlite_migration_guard as guard                          # noqa: E402
 from app.sqlite_migration_guard import sqlite_foreign_keys_suspended  # noqa: E402
@@ -1334,6 +1334,195 @@ def test_a_rebuild_of_a_cascade_parent_keeps_the_children(tmp_path):
             (1, "first", 1), (2, "second", 1), (3, "third", 1)
         ], "the rebuild cascaded and emptied the room"
         assert _foreign_key_enforcement(engine) == {1}
+    finally:
+        engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# What the guard does when there is no ordinary file-backed database to guard:
+# an offline `--sql` run, a database that lives in the connection, and a file
+# reached by a route the URL does not describe. None of these needs a schema,
+# and none of them travelled with the first pass of this port because the
+# classification that drove it covered only the fixture-bound tests.
+# ---------------------------------------------------------------------------
+
+def test_offline_mode_is_a_no_op():
+    """ac-01. What Alembic's `--sql` mode actually hands the guard.
+
+    Not None. `context.get_bind()` in offline mode returns a `MockConnection`
+    whose `.dialect.name` is `sqlite`, so a guard keyed on a None sentinel -- as
+    this was -- runs the entire online path against it. Measured: `AttributeError`
+    out of the guard, plus three ERROR lines on the way, including the full "this
+    run may have left foreign key violations, treat this database's contents as
+    unverified" warning. On a run that never touched a database.
+
+    So the check is for the capability the guard needs rather than a sentinel it
+    hopes for. A real `MockConnection` here, not a stand-in, because the previous
+    version of this test passed `None` literally: its mutation went RED while the
+    condition it modelled never occurred, which is a green tick over an untested
+    path.
+
+    Emitting nothing into the generated script matters on its own. That script
+    may be applied by a DBA against a different engine, and
+    `PRAGMA foreign_keys=OFF` is not a thing to hand someone for a database
+    nobody here has seen.
+    """
+    emitted = []
+    mock = create_mock_engine("sqlite://", lambda sql, *a, **k: emitted.append(str(sql)))
+    assert mock.dialect.name == "sqlite", "a dialect check alone would not stop here"
+
+    with sqlite_foreign_keys_suspended(mock):
+        emitted.append("-- the migration body --")
+
+    assert emitted == ["-- the migration body --"], (
+        f"the guard emitted SQL into an offline script: {emitted}"
+    )
+
+
+# Every URL form whose database dies with the connection. The `file:...uri=true`
+# form is the one most often paired with StaticPool in a pytest fixture, and it
+# is the one a `url.database` check misses: SQLAlchemy parses the query string
+# out, so `url.database` is `'file:x'` and reads as an ordinary filename.
+# `sqlite:///` with an empty path is a temporary on-disk database, which SQLite
+# also deletes when the last connection closes.
+DATABASES_THAT_DIE_WITH_THE_CONNECTION = [
+    "sqlite://",
+    "sqlite:///:memory:",
+    "sqlite:///file:shared_mem?mode=memory&cache=shared&uri=true",
+    "sqlite:///",
+]
+
+
+@pytest.mark.parametrize("url", DATABASES_THAT_DIE_WITH_THE_CONNECTION)
+@pytest.mark.parametrize("pool", [None, StaticPool], ids=["default-pool", "static-pool"])
+def test_an_in_memory_database_survives_a_failed_restore(pool, url):
+    """ac-01. The discard must not be the data loss.
+
+    On a file-backed database, dropping the connection when enforcement cannot be
+    confirmed is cheap insurance. On `sqlite://` the database *is* the connection
+    -- the schema lives in the process, not on disk -- so the same insurance
+    deletes everything the migration just built. Measured before this was fixed:
+    the table was gone under both pool classes.
+
+    The originating build was file-backed and could never have shown it. An
+    in-memory database is a common default for a test suite, and the failure is
+    worse there than anywhere: every later test raises "no such table", which is
+    exactly the kind of error a fixture catches and continues past, reporting a
+    pass that means nothing.
+    """
+    engine = create_engine(url, **({"poolclass": pool} if pool else {}))
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            connection.exec_driver_sql("INSERT INTO t (id) VALUES (1)")
+            connection.commit()
+
+            with pytest.raises(RuntimeError) as raised:
+                with sqlite_foreign_keys_suspended(connection):
+                    # Open transaction, so the restore cannot take and the guard
+                    # reaches the discard.
+                    connection.exec_driver_sql("INSERT INTO t (id) VALUES (2)")
+
+            assert "NOT been discarded" in str(raised.value)
+            assert "in-memory" in str(raised.value)
+            # The operator is told the connection may be unprotected -- the
+            # tradeoff is announced, not hidden -- and told what to do about it.
+            # Both halves asserted: removing the second sentence left the suite
+            # green, and it is the only actionable thing in the message.
+            assert "enforcement may be off" in str(raised.value)
+            assert "restart rather than carrying on" in str(raised.value)
+
+        with engine.connect() as connection:
+            assert connection.exec_driver_sql("SELECT count(*) FROM t").scalar() == 1, (
+                "the schema survived but its rows did not"
+            )
+    finally:
+        engine.dispose()
+
+
+def test_a_file_reached_through_creator_is_still_discarded(tmp_path):
+    """ac-01. The other direction of the same misdetection.
+
+    `create_engine("sqlite://", creator=...)` opens a real file while the URL
+    describes nothing -- `url.database` is None, which a URL-based check reads as
+    in-memory. It would then decline to discard a connection whose enforcement it
+    could not confirm, on a database that would have survived the discard
+    perfectly well. Fail-open in exactly the direction this guard exists to
+    prevent.
+
+    Asking the driver gets both directions right from one question.
+    """
+    path = tmp_path / "real.db"
+    engine = create_engine("sqlite://", creator=lambda: sqlite3.connect(str(path)))
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+            connection.commit()
+
+            with pytest.raises(RuntimeError) as raised:
+                with sqlite_foreign_keys_suspended(connection):
+                    connection.exec_driver_sql("INSERT INTO t (id) VALUES (1)")
+
+            assert "has been discarded" in str(raised.value), (
+                f"a real file was mistaken for an in-memory database and a "
+                f"connection that may not be enforcing was kept: {raised.value}"
+            )
+            assert connection.invalidated
+    finally:
+        engine.dispose()
+
+    # ...and the file is still there, which is the whole reason discarding it
+    # was safe.
+    survivor = sqlite3.connect(str(path))
+    assert survivor.execute(
+        "SELECT count(*) FROM sqlite_master WHERE name='t'"
+    ).fetchone()[0] == 1
+    survivor.close()
+
+
+def test_the_detector_reads_main_and_not_an_attached_database(tmp_path):
+    """ac-01. `PRAGMA database_list` reports every attached database, not one.
+
+    The detector filters for `main`, and that filter was unpinned: deleting it
+    left the originating suite green, because nothing there attached anything. An
+    in-memory database with a file-backed database attached is the case that
+    separates them -- `main` has no file and the attachment does, so a detector
+    reading the LAST row gets the opposite answer and discards a connection that
+    *is* the database.
+
+    Specifically the last row, and not "whichever row it likes". `main` is always
+    seq 0, so a detector that simply reads the first row it is given returns the
+    identical answer to one that filters for `main`, on every database. Measured
+    while mutating this: dropping the filter for the first row is a no-op and the
+    whole suite stays green, which reads exactly like a test with nothing behind
+    it. The mutation that this test actually catches is an iteration that keeps
+    the last answer instead of the matching one.
+    """
+    attached = tmp_path / "side.db"
+    sqlite3.connect(str(attached)).close()
+
+    engine = create_engine("sqlite://", poolclass=StaticPool)
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql(f"ATTACH DATABASE '{attached}' AS side")
+            listed = connection.exec_driver_sql("PRAGMA database_list").fetchall()
+            assert len(listed) == 2, f"expected main + side, got {listed}"
+            assert guard._database_lives_in_the_connection(connection) is True, (
+                f"the attached file was mistaken for main's: {listed}"
+            )
+    finally:
+        engine.dispose()
+
+    # ...and the mirror image: a file-backed main with an in-memory attachment.
+    main = tmp_path / "main.db"
+    engine = create_engine(f"sqlite:///{main}")
+    try:
+        with engine.connect() as connection:
+            connection.exec_driver_sql("ATTACH DATABASE ':memory:' AS scratch")
+            assert guard._database_lives_in_the_connection(connection) is False, (
+                "an in-memory attachment made a file-backed database look "
+                "disposable, which would keep a disarmed connection"
+            )
     finally:
         engine.dispose()
 
