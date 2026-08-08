@@ -116,20 +116,26 @@ def sqlite_foreign_keys_suspended(connection):
     **Why it is needed.** SQLite cannot drop or alter a column in place, so
     Alembic's ``batch_alter_table`` does it by move-and-copy: build a temporary
     table, copy the rows, ``DROP TABLE`` the original, rename. Under the pragma
-    :func:`_enforce_sqlite_foreign_keys` sets above, SQLite's ``DROP TABLE``
-    performs an implicit ``DELETE FROM`` which **fires foreign key actions**, so
-    rebuilding a table that other rows point at runs their ``ON DELETE`` rules. In
-    this schema a batch rebuild of ``participant`` runs
-    ``utterance.participant_id``'s ``ON DELETE SET NULL`` over every stored line
-    and hands back a deposition with the speakers stripped out of it, silently.
-    Five revisions batch-drop a column from a table that is a foreign key parent
-    -- ``f8cf64c6119a`` and ``77b111965bee`` and ``244e04cf11b4`` (``operator``,
-    parent of ``session.operator_id``), ``fdacc86a35ae`` (``session``),
-    ``a32ef7817b9d`` (``participant``) -- and none of them wants those actions to
-    fire. The criterion is a batch block containing a ``drop_column``, in either
-    direction: ``582ec9a2361c`` and ``0dd59a77d98a`` also use
-    ``batch_alter_table`` but only for indexes, which Alembic does without a
-    table rebuild.
+    the ``connect`` listener the ``SQLITE-FK`` check asks builds for, SQLite's
+    ``DROP TABLE`` performs an implicit ``DELETE FROM`` which **fires foreign key
+    actions**, so rebuilding a table that other rows point at runs their
+    ``ON DELETE`` rules.
+
+    A worked example, from the build this came from rather than from yours: a
+    batch rebuild of its ``participant`` table ran ``utterance.participant_id``'s
+    ``ON DELETE SET NULL`` over every stored line, and handed back a legal
+    deposition transcript with the speaker stripped off every line of testimony.
+    Nothing raised. The severity depends on the rule -- ``SET NULL`` loses the
+    reference, ``CASCADE`` loses the row -- and both are covered by the tests.
+
+    **How to tell whether your own migrations are exposed.** The criterion is a
+    ``batch_alter_table`` block containing a ``drop_column``, in either direction,
+    on a table that is a foreign key parent. Five of that build's revisions met
+    it. A ``batch_alter_table`` used only for indexes does not: Alembic does those
+    without a table rebuild. You do not need to enumerate them to be safe -- the
+    guard wraps the whole run -- but you do need to know the shape, because it is
+    what makes a migration that looks like a column drop into one that deletes
+    another table's rows.
 
     Postgres needs none of this: there the same operation is a native
     ``ALTER TABLE ... DROP COLUMN`` and touches no other table. A no-op on every
@@ -183,13 +189,17 @@ def sqlite_foreign_keys_suspended(connection):
     a baseline taken before the run, because it scans the whole database rather
     than the run's work.
 
-    It is **no backstop for the defect this guard exists for.**
-    ``utterance.participant_id`` is nullable, so ``ON DELETE SET NULL`` stripping
-    the speaker off every line of a deposition is not a violation: measured on
-    fifty unnamed lines, ``foreign_key_check`` returns no rows and
-    ``integrity_check`` returns ``ok``. Nothing this check reports will tell you
-    the suspension failed. Reading both ends of the pragma back is what does
-    that, and it is not optional because the check is quiet.
+    It is **no backstop for the defect this guard exists for**, and this is the
+    single most important sentence in these notes. ``ON DELETE SET NULL`` over a
+    *nullable* column leaves a database this check calls clean: the children are
+    still there, their foreign key is now NULL, and NULL is not a violation.
+    Measured on the originating build, over fifty rows whose parent reference had
+    just been erased, ``foreign_key_check`` returned no rows and
+    ``integrity_check`` returned ``ok``.
+
+    So nothing this check reports will tell you the suspension failed. Reading
+    both ends of the pragma back is what does that, and it is not optional
+    because the check is quiet.
 
     **What fails the run.** Never damage known to predate it; where it cannot
     tell, the tie-break is whether failing would ever clear. Four branches, and
@@ -231,129 +241,60 @@ def sqlite_foreign_keys_suspended(connection):
       enforcement when the inner one exits, while the outer still needs it off.
       There is one caller, in ``migrations/env.py``, and it should stay that way.
     - **Two full-database scans per migration run**, one baseline and one check.
-      Linear in row count -- 11.4 ms per scan over 120,000 utterances here -- and
+      Linear in row count -- 11.4 ms per scan over 120,000 rows on the
+      originating build -- and
       paid on every ``flask db upgrade``, including deploys that migrate nothing.
       Immaterial at this size; a build with a very large table should measure
       rather than assume.
-    - **This guard has never been executed on the interpreter its CI pins.**
-      CI runs Python 3.11 (``.github/workflows/test.yml``, and the same in
-      ``template-python-flask``); the only interpreter on the machine every green
-      number in its development came from is 3.12. That is not a hypothetical
-      gap: a multi-line f-string replacement field -- PEP 701, 3.12-only -- was
-      committed here and stood for a commit, parsing locally and red on push.
-      ``test_no_source_file_here_needs_a_newer_python_than_ci_runs`` is a
-      tripwire for that one construct, not evidence of 3.11 compatibility.
-      **Run the suite on 3.11 before trusting it.**
-    - **Porting the tests is where this goes wrong, and the destination has no
-      schema.** ``template-python-flask`` has no ``app/models``, no
-      ``migrations/`` and no app factory with tables -- verified, not assumed. So
-      "copy and re-fixture" is not available: there is nothing to re-fixture
-      against. Of 38 test functions here, 14 take no `migrated_app` and 24 depend on
-      ``migrated_app``, and **every proof of the invariant is among them**.
-      Either they are rewritten to build their own schema or the proof does not
-      travel. Classification, so nobody has to re-derive it from the test bodies:
+    - **It has now been run on both interpreters the CI matrix pins**, which was
+      not true when it was written. The originating build developed every green
+      number on 3.12 while its CI pinned 3.11, and that gap shipped a real defect:
+      a multi-line f-string replacement field, PEP 701 and 3.12-only, parsed
+      locally and reddened CI. The gap was closed deliberately before this was
+      ported, and ``test_no_source_file_here_needs_a_newer_python_than_ci_runs``
+      in ``tests/test_conventions.py`` is the tripwire that keeps it closed. If
+      you change the matrix in ``.github/workflows/test.yml``, change
+      ``OLDEST_PYTHON_CI_RUNS`` beside that test in the same edit.
+    - **The tests travelled, and what that cost is worth knowing before you
+      touch them.** This section used to be the porting plan. The port is done:
+      ``tests/test_sqlite_migration_guard.py`` holds every proof of the invariant,
+      built against two throwaway tables -- a parent, a child, a foreign key --
+      rather than any product schema.
 
-      **(a) Can be schema-agnostic -- rewrite against two throwaway tables.**
-      Twenty-one of the 24 (21 + 2 + 1 = 24). They need a parent, a child with a foreign key, and a
-      row in each; nothing about depositions. Full names, because a reader
-      working this list is deciding what to drop:
-      ``test_the_guard_suspends_enforcement_and_puts_it_back``,
-      ``test_a_suspension_that_did_not_take_is_refused_rather_than_trusted``,
-      ``test_rows_orphaned_while_enforcement_was_off_are_reported``,
-      ``test_an_orphan_that_predates_the_run_is_not_blamed_on_it``,
-      ``test_the_baseline_diff_survives_a_rebuild_that_renumbers_rowids``,
-      ``test_the_baseline_diff_survives_a_rebuild_that_renumbers_constraints``,
-      ``test_a_table_that_is_its_own_parent_survives_its_own_rebuild``,
-      ``test_a_clean_run_reports_nothing_and_restores_enforcement``,
-      ``test_a_connection_whose_restore_failed_never_goes_back_to_the_pool``,
-      ``test_a_violation_the_run_committed_is_reported_even_if_the_restore_fails``,
-      ``test_no_statement_in_the_guard_can_leave_the_pool_disarmed``,
-      ``test_the_one_fail_open_warns_about_the_run_rather_than_excusing_it``,
-      ``test_the_guard_never_replaces_the_migration_failure_it_is_unwinding``,
-      ``test_a_discard_that_cannot_happen_is_reported_not_raised``,
-      ``test_a_failed_in_memory_check_is_reported_and_not_swallowed``,
-      ``test_an_interrupt_on_the_exit_path_is_not_swallowed``,
-      ``test_an_interrupted_migration_surfaces_the_interrupt``,
-      ``test_the_operators_interrupt_wins_not_the_one_the_guard_provoked``,
-      ``test_rolling_back_past_the_session_rebuild_keeps_the_participants``
-      (as: parent with an ``ON DELETE CASCADE`` child, rebuild the parent,
-      assert the children survive),
-      ``test_rolling_the_title_column_back_does_not_unname_the_testimony``
-      (the headline data-loss path -- already ported as
-      ``test_a_rebuild_does_not_strip_the_child_rows_on_a_schema_built_here``),
-      and ``test_a_failure_inside_the_guards_own_exit_still_restores_enforcement``
-      -- **do not drop this one**: it is the only evidence for fitness case 5b,
-      the documented fail-open, and an earlier version of this list omitted it.
+      The originating suite had 38 test functions. 24 were bound to its app
+      fixture and 14 were not, and **every proof of the invariant was among the
+      24**, so "copy and re-fixture" was never available: this template has no
+      ``app/models``, no ``migrations/`` and no app factory with tables. They were
+      rewritten rather than transformed.
 
-      ``test_the_invariant_holds_on_a_schema_the_guard_has_never_seen`` and
-      ``test_a_rebuild_does_not_strip_the_child_rows_on_a_schema_built_here``
-      are the worked examples of the rewrite, already done here and already
-      copyable. Three others -- the two renumbering tests and the
-      self-referential one -- already build their own tables and use the fixture
-      only for an engine, so they are nearly copies today.
+      What did NOT travel, and why, because each is a real hole rather than an
+      oversight:
 
-      **(b) Needs a real app + migrations stack; ship as a test a build must
-      instantiate.** Two.
-      ``test_a_guard_failure_stops_a_real_migration_and_says_why`` must assert
-      that a guard ``RuntimeError`` reaches the operator as a non-zero exit
-      through the migration runner -- that chain is the thing under test and a
-      direct call cannot stand in for it.
-      ``test_a_run_that_rebuilt_a_table_gives_the_connection_back_enforcing``
-      must assert enforcement across the pool after a real up/down/up over the
-      build's own revisions. Both should ship as documented stubs stating what to
-      assert, not as code that silently passes.
+      * **Two proofs that need a real migrations stack.** That a guard failure
+        reaches the operator as a non-zero exit *through the migration runner*,
+        and that the pool comes back enforcing after a real up/down/up over real
+        revisions. They ship at the bottom of the test file as skips carrying
+        instructions, and ``test_the_two_build_specific_stubs_are_still_here``
+        fails if either is deleted. **Instantiate them in your build.** Everything
+        else hand-writes Alembic's move-and-copy, which is what lets it travel and
+        is also the one thing it no longer pins.
+      * **One test about the originating build's own models**, which said nothing
+        about the guard.
 
-      **(c) Specific to this build; should not travel.** One.
-      ``test_running_the_migrations_leaves_nothing_for_autogenerate_to_add``
-      compares this build's models to its migrations and says nothing about the
-      guard.
+      Four tests travelled under different names, because four were named after
+      the schema they were bound to. That map is ``PORTED_FROM`` in the test file,
+      as data, and ``test_every_rename_points_at_a_test_that_exists`` keeps it
+      honest -- prose lost those renames three separate times during the port,
+      each time reporting finished work as missing.
 
-      **Also needs re-pointing, though it copies as code:**
-      ``test_the_coverage_annotations_are_true`` is name-coupled to three of the
-      24 through its probe table. Copied unchanged into a build that renamed
-      them, its probes name tests that no longer exist -- which is caught loudly
-      only because that check now requires pytest to exit 1 rather than nonzero.
-      Re-point the probe table when you re-fixture.
+      **A test that borrows a standard fixture can only confirm the standard
+      case.** ``WITHOUT ROWID``, the self-referential foreign key and both
+      renumbering cases were found by building the shape deliberately, so the
+      schema-agnostic form is the better test here, not a weakened substitute.
 
-      This classification is asserted complete by
-      ``test_the_port_classification_names_every_fixture_bound_test``; an earlier
-      version enumerated 21 of them and the two it dropped were load-bearing.
-
-      **Every count in these notes that is not asserted has been wrong at
-      least once.** Five were corrected in one round: 31/8, 63, 16, and two
-      stale 23s that sat outside the count regex. The three that are
-      asserted (`test_the_port_classification_names_every_fixture_bound_test`)
-      have not drifted since. Treat any bare number here as indicative.
-
-      **A mutation harness needs a restore path that runs on signals.**
-      Three separate agents on this build left a source file mutated when a
-      tool timeout SIGTERM'd them mid-batch; a `finally` does not run on
-      SIGTERM. Restore from a private pre-mutation copy, verify by digest,
-      and install a signal handler -- not just a happy-path cleanup.
-
-      **The suite's own guard-rails can be deleted, and that is documented
-      rather than defended.** `test_the_suite_still_has_its_keystone` asserts
-      that every parametrized table is non-empty and every meta test still
-      exists, and names itself so its own removal is not silent; the
-      classification test's count assertion catches the keystone going missing,
-      so the two cover each other. Deleting **both together** is green -- measured, 66 passed.
-      No arrangement of tests inside one file prevents that -- which is why the
-      port checklist, read by a human, is the backstop rather than another test.
-
-      **And the audit will not catch you.** ``template-python-flask``'s
-      ``SQLITE-BATCH-MIGRATION`` check short-circuits the moment the substring
-      ``foreign_keys_suspended`` appears in ``env.py`` -- "when env.py uses it,
-      trust it". So a build that copies this helper's *name* and none of its
-      tests gets a green audit and a green suite, having proved nothing. The
-      check enforces that the guard is *called*; only the tests above enforce
-      that it *works*. That gap cannot be closed from the audit side, which is
-      why it is stated here.
-
-      One further note for whoever ports: a test that borrows the standard
-      fixture can only confirm the standard case. ``WITHOUT ROWID``, the
-      self-referential foreign key and both renumbering cases were all found by
-      building the shape rather than borrowing one, so the schema-agnostic form
-      is the better test, not a weakened substitute.
+      To check the tests still bite after you change the guard, run
+      ``python tools/mutate_sqlite_migration_guard.py``. It breaks the guard
+      twenty ways and reports any test that failed to notice.
     - **``foreign_key_check`` covers the ``main`` database only.** A build that
       ``ATTACH``es another database gets a clean report while the attached one
       holds violations. Not handled: nothing here attaches, and doing it properly
@@ -367,21 +308,20 @@ def sqlite_foreign_keys_suspended(connection):
       violation another connection commits mid-run is indistinguishable from one
       the rebuild caused. The baseline removes what predates the run, not what
       happens beside it.
-    - **On a Postgres-only build most of this is inert.** Everything is a no-op
-      off SQLite and the SQLite-specific tests skip, so the behaviour that
-      matters is not exercised. 14 test functions take no `migrated_app`, so
-      they run once rather than per backend, and that number is asserted.
-      Three fixture-bound tests also execute against Postgres (the
-      autogenerate check and the two seeded rollbacks), so 17 run there in
-      total -- that figure is measured, not asserted, and will drift. The 14
-      are
-      the offline no-op, the in-memory detection, the `creator=` case, the
-      attached-database filter, the schema-agnostic invariant walk and rebuild,
-      and the source-level checks -- so the suite is not entirely vacuous there,
-      but a green tick on Postgres alone is not evidence the suspension works.
-      (Both counts in this note are asserted by
-      ``test_the_port_classification_names_every_fixture_bound_test``; every
-      earlier hand-written count in these notes went stale, twice.)
+    - **On a Postgres-only build the guard is inert, but its tests are not.**
+      Everything here is a no-op off SQLite, so if your application database is
+      Postgres this code does nothing at runtime.
+
+      The tests still run, and this is a deliberate change from the originating
+      build. There, they hung off the app fixture and skipped on the wrong
+      dialect, so a Postgres CI leg reported green over a suspension nobody had
+      exercised. Here every test builds its own SQLite engine on ``tmp_path``, so
+      none of them consults your database or skips on its dialect. The guard is
+      proven wherever the suite runs.
+
+      What that does **not** establish is that *your* migrations are safe, since
+      on Postgres they never take the batch rebuild path at all. It is the guard
+      that is proven, not your revisions.
     """
     if connection is None or not hasattr(connection, "exec_driver_sql"):
         # Alembic's offline mode (`alembic upgrade --sql`) renders SQL to stdout
