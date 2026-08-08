@@ -860,6 +860,254 @@ def test_a_violation_the_run_committed_is_reported_even_if_the_restore_fails(tmp
         engine.dispose()
 
 
+def test_the_guard_never_replaces_the_migration_failure_it_is_unwinding(tmp_path):
+    """ac-01. The error the operator reads is the one that broke the migration.
+
+    The guard already declines to *raise* over a propagating failure. But its own
+    exit statements were once unguarded, so a run that died with the connection
+    -- which is a normal way for a migration to die -- surfaced
+    `ProgrammingError: Cannot operate on a closed database. [SQL: PRAGMA ...]`
+    and buried the real cause. The intent was stated in the code and not enforced
+    by it; this is the enforcement.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "never_replaces.db")
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(RuntimeError, match="THE REAL MIGRATION FAILURE"):
+                with sqlite_foreign_keys_suspended(connection):
+                    # The connection dies, then the migration does -- the order a
+                    # dropped connection or a killed backend produces.
+                    connection.connection.dbapi_connection.close()
+                    raise RuntimeError("THE REAL MIGRATION FAILURE")
+
+            # ...and the connection still does not go back to the pool:
+            # enforcement could not be confirmed, so it is discarded rather than
+            # trusted.
+            assert connection.invalidated
+    finally:
+        engine.dispose()
+
+
+def test_a_discard_that_cannot_happen_is_reported_not_raised(tmp_path):
+    """ac-01. `connection.invalidate()` is fallible too, and it is not SQL.
+
+    Every other statement in the exit path is a pragma, and the walk in
+    `test_the_invariant_holds_on_a_schema_the_guard_has_never_seen` fails each of
+    them by shadowing `exec_driver_sql`. The discard is neither: it was the last
+    statement in the block sitting outside a `try`, and it is exactly the shape of
+    thing that gets overlooked because it does not look like the others.
+
+    A `Connection` closed by the run makes it raise `ResourceClosedError`, which
+    unguarded replaces the guard's whole report -- and in a real migration would
+    replace the migration's own error, the property the test above is explicit
+    about preserving. It has to be reported like anything else, including the part
+    that matters most: that the connection may have gone back to the pool
+    unprotected.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "discard_cannot_happen.db")
+    try:
+        # Deliberately not a `with`: the run closes this connection itself.
+        connection = engine.connect()
+        with pytest.raises(RuntimeError) as raised:
+            with sqlite_foreign_keys_suspended(connection):
+                # A migration that closes its own connection: everything in the
+                # exit path fails after this, the discard included.
+                connection.close()
+
+        assert "could not be discarded" in str(raised.value), (
+            f"the failed discard was not reported; got: {raised.value}"
+        )
+        assert "may have returned to the pool unprotected" in str(raised.value), (
+            "the report does not say the connection may be unprotected, which is "
+            "the one thing an operator would act on"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_a_failed_in_memory_check_is_reported_and_not_swallowed(tmp_path, monkeypatch):
+    """ac-01. The step that decides whether to destroy the database.
+
+    `_database_lives_in_the_connection` was once annotated as covered by the two
+    in-memory tests. Neither exercises its *failure*, and it had both of the
+    faults its neighbours were fixed for: an interrupt caught there was swallowed,
+    and its failure was the only one in the exit path that was never reported.
+    Silent, in the branch that decides whether to delete a schema.
+    """
+    def failing_check(_connection):
+        raise KeyboardInterrupt("operator pressed Ctrl-C during the check")
+
+    monkeypatch.setattr(guard, "_database_lives_in_the_connection", failing_check)
+
+    engine = _a_schema_built_from_nothing(tmp_path / "in_memory_check_failed.db")
+    reported = _errors_from_the_guard()
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(KeyboardInterrupt):
+                with reported:
+                    with sqlite_foreign_keys_suspended(connection):
+                        # Open transaction, so the restore fails and the branch
+                        # that calls the check is reached.
+                        connection.exec_driver_sql(
+                            "INSERT INTO parent (id, label) VALUES (2, 'ctrl_c')"
+                        )
+
+        message = " ".join(reported.messages)
+        assert "Could not determine whether this database lives in the connection" in message, (
+            f"the failed check was never reported; logged: {message}"
+        )
+        assert "deletes an in-memory database" in message, (
+            "the report does not say what the blind decision costs"
+        )
+    finally:
+        engine.dispose()
+
+
+def test_an_interrupt_on_the_exit_path_is_not_swallowed(tmp_path):
+    """ac-01. One of the three non-SQL steps the walk cannot reach.
+
+    `raise interrupt` issues no SQL, so the invariant walk is blind to it:
+    deleting both its lines left the originating suite green. The consequence is
+    not cosmetic. An interrupt caught while running the exit `foreign_key_check`,
+    on a database whose baseline also could not run, goes into `notes` rather than
+    `problems` -- so `problems` is empty, the guard returns normally, and the
+    process exits 0. Ctrl-C during a migration becomes a successful migration.
+
+    The sibling test covers an interrupt arriving from the migration *body*,
+    which is a different path: that one sets `failed` and propagates on its own.
+    This is the exit path, where the guard has caught the interrupt itself and has
+    to give it back.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "interrupt_on_exit.db")
+    try:
+        with engine.connect() as connection:
+            real = connection.exec_driver_sql
+            checks = []
+
+            def failing(sql, *args, **kwargs):
+                if sql == "PRAGMA foreign_key_check":
+                    checks.append(sql)
+                    if len(checks) == 1:
+                        # No baseline, so the exit check's failure lands in
+                        # `notes` and leaves `problems` empty -- the case where
+                        # nothing else would carry the interrupt out.
+                        raise RuntimeError("injected: baseline unavailable")
+                    raise KeyboardInterrupt("operator pressed Ctrl-C")
+                return real(sql, *args, **kwargs)
+
+            connection.exec_driver_sql = failing
+            try:
+                with pytest.raises(KeyboardInterrupt):
+                    with sqlite_foreign_keys_suspended(connection):
+                        pass
+            finally:
+                connection.exec_driver_sql = real
+
+        # An interrupt landing between a pragma completing and its result being
+        # assigned leaves a SQLite handle reachable only from the traceback,
+        # holding the write lock until it is collected. Collected here so the
+        # enforcement read below is not racing a lock this test made.
+        gc.collect()
+        assert _foreign_key_enforcement(engine) == {1}, "and the pool is still armed"
+    finally:
+        engine.dispose()
+
+
+def test_an_interrupted_migration_surfaces_the_interrupt(tmp_path):
+    """ac-01. `except BaseException` on the run, and why it is not `Exception`.
+
+    The guard suppresses its own complaints when the run itself failed, so the
+    operator reads the real cause. That decision keys off `failed`, which is set
+    by the handler around the `yield` -- and if that handler only caught
+    `Exception`, a `KeyboardInterrupt` would leave `failed` False, so the guard
+    would raise its own `RuntimeError` about the restore *over* the interrupt.
+    Ctrl-C during a migration would report a foreign-key problem.
+
+    Narrowing that handler to `except Exception` left the whole originating suite
+    green before this test existed, which is the only reason it does.
+    """
+    engine = _a_schema_built_from_nothing(tmp_path / "interrupted_migration.db")
+    try:
+        with engine.connect() as connection:
+            with pytest.raises(KeyboardInterrupt):
+                with sqlite_foreign_keys_suspended(connection):
+                    # An open transaction, so the restore fails and the guard has
+                    # something of its own it would otherwise raise about.
+                    connection.exec_driver_sql(
+                        "INSERT INTO parent (id, label) VALUES (2, 'interrupted')"
+                    )
+                    raise KeyboardInterrupt
+
+            # The complaint is still logged and the connection still discarded --
+            # suppressed as an exception, not as a fact.
+            assert connection.invalidated
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.parametrize("later_site", ["the exit check", "the in-memory check"])
+def test_the_operators_interrupt_wins_not_the_one_the_guard_provoked(
+    tmp_path, monkeypatch, later_site
+):
+    """ac-01. `interrupt is None` on both sites that can overwrite, not one.
+
+    Three handlers assign `interrupt`. The first cannot overwrite anything -- it
+    is None there by construction -- so it carries no guard. The other two run
+    after it, in order: the exit `foreign_key_check`, then the in-memory check.
+    Without their guards the interrupt handed back is whichever fired *last*,
+    which is one the guard provoked while unwinding rather than the one the
+    operator sent.
+
+    Parametrized over both, because an earlier version exercised only the
+    in-memory site: removing the guard from the exit-check handler was a real
+    semantic change that passed.
+    """
+    first = KeyboardInterrupt("the operator pressed Ctrl-C")
+    later = KeyboardInterrupt("provoked later, while unwinding")
+
+    def failing_check(_connection):
+        if later_site == "the in-memory check":
+            raise later
+        return False
+
+    monkeypatch.setattr(guard, "_database_lives_in_the_connection", failing_check)
+
+    engine = _a_schema_built_from_nothing(tmp_path / f"interrupt_{later_site[4:]}.db")
+    try:
+        with engine.connect() as connection:
+            real = connection.exec_driver_sql
+            checks = []
+
+            def failing(sql, *args, **kwargs):
+                if sql == "PRAGMA foreign_keys=ON":
+                    raise first                     # first assignment site
+                if sql == "PRAGMA foreign_key_check":
+                    checks.append(sql)
+                    # The SECOND one is the exit check; the first is the
+                    # baseline, which runs before anything is suspended and whose
+                    # handler deliberately lets a BaseException through.
+                    if len(checks) == 2 and later_site == "the exit check":
+                        raise later                 # second assignment site
+                return real(sql, *args, **kwargs)
+
+            connection.exec_driver_sql = failing
+            try:
+                with pytest.raises(KeyboardInterrupt) as raised:
+                    with sqlite_foreign_keys_suspended(connection):
+                        pass
+            finally:
+                connection.exec_driver_sql = real
+
+        assert raised.value is first, (
+            f"with the interrupt arriving at {later_site}, the guard handed back "
+            f"{str(raised.value)!r} -- which it provoked itself -- instead of the "
+            f"operator's interrupt"
+        )
+    finally:
+        gc.collect()
+        engine.dispose()
+
+
 # ---------------------------------------------------------------------------
 # The two proofs that CANNOT be schema-agnostic.
 #
