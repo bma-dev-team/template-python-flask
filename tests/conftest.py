@@ -1,6 +1,7 @@
 """Test-session hooks shared by every build scaffolded from this template.
 
-Currently one thing: say out loud when an entire parametrised leg did not run.
+Two things: say out loud when an entire parametrised leg did not run, and put
+back the per-test timeout that reporting a failure takes away.
 
 **Why this exists.** Twice on the deposition build a whole verification leg was
 silently absent from every number anyone quoted, and both times the number
@@ -27,7 +28,75 @@ from __future__ import annotations
 
 import re
 
+import pytest
+
 _PARAM_RE = re.compile(r"\[(.+)\]$")
+
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_exception_interact(node, call, report):  # noqa: ARG001
+    """Put back the per-test timeout that reporting a failure just took away.
+
+    **The defect this closes, measured rather than reasoned.** `pytest-timeout`
+    cancels the item's timer from this same hook -- it does so for the `--pdb`
+    case, so a debugger session is not killed mid-inspection -- and never re-arms
+    it. So the *first* failure in a test disarms `pyproject.toml`'s `timeout` for
+    everything that comes after it, and what comes after it is **fixture
+    teardown**.
+
+    That is the wrong half to leave unbounded. Teardown is where a suite does its
+    blocking work: closing sockets, joining threads, dropping schemas. On the
+    build this came from, a socket test that failed for a stated reason then hung
+    its run forever -- **one byte of output (`F`), no summary, no stack dump**,
+    killed only by an outer wall clock. Before and after, same test, same box:
+
+    ==================  ==============================================
+    without this hook   `exit 124` (an outer timeout), 403 bytes of output
+    with it             `exit 1` (a real failure), 8981 bytes with the report
+    ==================  ==============================================
+
+    **Any pytest suite with blocking fixture teardowns has this**, which is why it
+    is in the template rather than in one build. It is not specific to sockets or
+    to databases; it needs only a teardown that can block and a test that can
+    fail, and the second is not optional.
+
+    Re-armed at the full timeout rather than at whatever was left of it. The point
+    is a bound, not an accounting: a test that has already failed deserves the
+    same budget for its teardown as a passing one.
+
+    **`--pdb` keeps its exemption**, which is the reason the plugin cancels here
+    in the first place. This is `trylast`, so it does not run until pytest's own
+    post-mortem hookimpl has returned, and it declines outright when a debugger is
+    what the run is entering.
+
+    **Deliberately narrow**: only a real test item, and only when the timer is the
+    one installed around the whole runtest protocol, because that is the only case
+    with a cancel on the other side of it. Anything else would leave a live timer
+    that nothing turns off.
+
+    One private API, `_get_item_settings`, is read here; the re-arm itself goes
+    through the plugin's public `pytest_timeout_set_timer` hook. If a future
+    plugin version moves that machinery, the `except` below means the cost is
+    **the bound, not the failure report** -- the failure being reported right now
+    matters more than the ceiling on what follows it.
+
+    Proven by `tests/test_timeout_rearm.py`, which runs a failing test with a
+    blocking teardown in a subprocess, with this hook and without it.
+    """
+    if node.config.getoption("usepdb", False):
+        return
+    if not isinstance(node, pytest.Item):
+        return
+    try:
+        import pytest_timeout
+
+        settings = pytest_timeout._get_item_settings(node)
+        if not settings.timeout or settings.timeout <= 0 or settings.func_only is not False:
+            return
+        node.config.pluginmanager.hook.pytest_timeout_set_timer(item=node, settings=settings)
+    except Exception:  # pragma: no cover - never break failure reporting
+        pass
 
 
 def _param_values(nodeid: str) -> list[str]:

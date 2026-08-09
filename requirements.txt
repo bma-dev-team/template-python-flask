@@ -3,6 +3,7 @@ flask-wtf>=1.2  # CSRF protection + csrf_token() for the shared form macros (_bm
 gunicorn>=21.2  # production WSGI server (Railway deploy reads Procfile)
 python-dotenv>=1.0
 pytest>=8.0
+pytest-timeout>=2.3  # wall-clock ceiling per test; tests/conftest.py re-arms it after a failure
 pyyaml>=6.0
 cryptography>=42.0  # Fernet-encrypted named-secret store (app/secret_store.py)
 # playwright>=1.40  # dev-only: install + `playwright install chromium` to run scripts/walkthrough_screenshots.py

@@ -26,3 +26,12 @@ include = ["app*"]
 # `pip install -e .` in CI. Every per-build repo generated from this
 # template inherits this so its CI run starts green from commit zero.
 pythonpath = ["."]
+# A wall-clock ceiling per test, so a hung test is a failure with a stack dump
+# rather than a CI job that runs until the runner kills it. This is a BACKSTOP,
+# not a performance budget: it is deliberately generous, and a build whose suite
+# has a legitimately slower test should raise it rather than delete it. A guard
+# that reddens correct work is a guard someone switches off.
+#
+# tests/conftest.py re-arms this after a failure. Without that, the FIRST failing
+# test disarms the ceiling for its own teardown -- see the hook's docstring.
+timeout = 300
