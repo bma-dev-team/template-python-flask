@@ -179,3 +179,117 @@ def test_batch_migration_check_flags_inline_suspend_without_check(tmp_path):
     assert len(v) == 1
     assert v[0].rule == "SQLITE-BATCH-MIGRATION"
     assert "foreign_key_check" in v[0].message
+
+
+# --- a file that is not the text you think it is ----------------------------
+#
+# Extensions whose files are SOURCE: text a person reads and git diffs. Kept
+# generous on purpose, and it must stay that way. Narrowing this to what a
+# given repo happens to contain today is how the check goes quiet for the first
+# file of a new kind somebody adds -- which is exactly the file nobody is
+# looking at yet.
+_TEXT_SOURCE_SUFFIXES = (
+    ".py", ".js", ".mjs", ".ts", ".jsx", ".tsx", ".html", ".htm", ".css",
+    ".scss", ".md", ".txt", ".yml", ".yaml", ".json", ".toml", ".ini", ".cfg",
+    ".sql", ".sh", ".env-example", ".csv",
+)
+
+# Where a build keeps source. A repo without one of these simply skips it, so
+# this list can carry names this template does not itself use.
+_SOURCE_FOLDERS = ("app", "tests", "migrations", "scripts", "tools")
+
+
+def _shipped_text_sources():
+    """Every file in this repo that is meant to be readable text."""
+    root = pathlib.Path(__file__).resolve().parent.parent
+    for folder in _SOURCE_FOLDERS:
+        base = root / folder
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if not path.is_file() or path.suffix not in _TEXT_SOURCE_SUFFIXES:
+                continue
+            if NOT_OUR_SOURCE & set(path.parts):
+                continue
+            yield path
+
+
+def test_no_source_file_carries_a_byte_that_makes_git_call_it_binary():
+    """A NUL in a source file is invisible, harmless-looking, and shipped once.
+
+    **WHY THIS EXISTS.** On 2026-08-21 a build shipped `audio_signal.js` with a
+    single NUL byte in it -- `return a + "\\0" + b;` where a space was meant.
+    Nothing caught it and nothing could have:
+
+    * **every test passed**, because NUL is a perfectly legal character in a
+      JavaScript string. The map keys were `"0\\x001"` instead of `"0:1"` and
+      the code behaved exactly as designed.
+    * `node --check` parsed it.
+    * **git silently reclassified the file as binary** -- `Bin 0 -> 7250 bytes`
+      in the diffstat instead of 170 lines of reviewable JavaScript. A binary
+      file has no diff, no blame and no review.
+
+    The behaviour was never wrong, which is the uncomfortable part: a green
+    suite was never going to be evidence, because what was broken was not the
+    behaviour. It was whether a person could review the file at all. It was
+    found by reading the diffstat of a push range, and by nothing else.
+
+    This check asks the one question that would have come out differently.
+    """
+    offenders = []
+    for path in _shipped_text_sources():
+        data = path.read_bytes()
+        if b"\x00" in data:
+            offset = data.index(b"\x00")
+            line = data[:offset].count(b"\n") + 1
+            offenders.append(f"{path}: NUL at byte {offset}, line {line}")
+    assert not offenders, (
+        "these source files contain a NUL byte, so git treats them as binary "
+        "and they have no reviewable diff:\n" + "\n".join(offenders)
+    )
+
+
+def test_the_binary_byte_check_would_actually_fire(tmp_path, monkeypatch):
+    """The check above passes trivially on a clean tree, so prove it can fail.
+
+    **"No offenders found" is exactly the result that stays green when the scan
+    is looking in the wrong place** -- at the wrong folders, or for the wrong
+    extensions. So this plants a NUL in a `.js` file, which is the extension the
+    original defect actually shipped in, and asserts both that the walk reaches
+    it and that the check reports it.
+    """
+    (tmp_path / "app").mkdir()
+    planted = tmp_path / "app" / "planted.js"
+    planted.write_bytes(b'var pair = a + "\x00" + b;\n')
+    clean = tmp_path / "app" / "clean.js"
+    clean.write_text('var pair = a + " " + b;\n')
+
+    found = []
+    for folder in _SOURCE_FOLDERS:
+        base = tmp_path / folder
+        if not base.is_dir():
+            continue
+        for path in sorted(base.rglob("*")):
+            if path.is_file() and path.suffix in _TEXT_SOURCE_SUFFIXES:
+                if b"\x00" in path.read_bytes():
+                    found.append(path)
+
+    assert planted in found, (
+        "the walk did not reach a planted NUL in a .js file under app/, so the "
+        "real check above is passing because it is looking in the wrong place"
+    )
+    assert clean not in found, "a clean file was reported as an offender"
+
+
+def test_the_suffix_list_covers_the_extension_the_defect_shipped_in():
+    """Pinned separately, because the walk and the list fail differently.
+
+    A future edit that trims this list to "the extensions this repo happens to
+    contain" would leave the check green and blind to the next `.js`, `.ts` or
+    `.sql` file somebody adds. The defect shipped in a `.js` file.
+    """
+    for suffix in (".js", ".py", ".html", ".css", ".sql", ".yml", ".json"):
+        assert suffix in _TEXT_SOURCE_SUFFIXES, (
+            f"{suffix} is no longer treated as reviewable source, so a NUL in "
+            "one would go unnoticed"
+        )

@@ -22,6 +22,29 @@ pytest
 
 Then add your first feature under `app/` and corresponding tests under `tests/`.
 
+### A bare `pytest` may be running half your suite
+
+**Whatever a build needs in order to run its WHOLE test suite belongs in this
+README**, next to the command, and not only in a checklist somewhere else.
+
+A build that keeps a database-backed leg behind an environment variable will
+SKIP that leg silently when the variable is unset -- and a skip is not a
+failure, so the run is green. One build ran with 739 of its tests skipped on
+every fresh clone for three days. The invocation that turns them on had been
+written down since the first day, in a checklist the developer had no reason
+to open, and never in the repo. Half the suite was not being run and nothing
+said so.
+
+So: if this project grows a leg that needs a service, a variable or a browser,
+put the command HERE, and make the suite say what it skipped:
+
+```bash
+pytest -rA          # -rA prints every skip WITH ITS REASON
+```
+
+A skip count is not information. A skip reason is. Read the reasons before
+believing a green run covered what you think it covered.
+
 ## What's in the template
 
 | Path | Purpose | IP category |
