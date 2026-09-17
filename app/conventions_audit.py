@@ -1,11 +1,18 @@
-"""Static audit of BMA UX/dev conventions over a build's templates.
+"""Static audit of BMA UX/dev conventions over a set of templates.
 
 Each check maps to a rule id in developer-guides/architecture/BMA_UX_CONVENTIONS.md (BMA repo).
-The build's CI runs tests/test_conventions.py, which fails on any violation -- so the conventions
-are enforced per build without manual testing. Suppress a specific violation with an inline
-marker on the violating line or the line directly above it:
+CI runs tests/test_conventions.py, which fails on any violation -- so the conventions are
+enforced without manual testing. Suppress a specific violation with an inline marker on the
+violating line or the line directly above it, with the reason after `--`:
 
     {# conventions: allow UX-I.B -- AC #7 GET-only filter form #}
+
+One file, two layouts. The BMA platform (ERW PR #41) and every clone run this same module:
+a clone keeps templates under app/templates and static under app/static (the defaults);
+the platform passes templates_dir="templates" and static_dir="static". Both layouts also
+accept the timestamp mechanism they actually use: the shared localized_time() macro, or the
+platform's `|localized_datetime` / `|localized_date` Jinja filters, which emit the same
+<time datetime=...> element (app.py, _localized_datetime_filter).
 """
 from __future__ import annotations
 
@@ -29,6 +36,7 @@ _ALLOW_RE = re.compile(r"conventions:\s*allow\s+([A-Za-z0-9.\-]+)")
 _FORM_RE = re.compile(r"<form\b([^>]*)>(.*?)</form>", re.DOTALL | re.IGNORECASE)
 _BUTTON_RE = re.compile(r"<button\b([^>]*)>", re.IGNORECASE)
 _TYPE_RE = re.compile(r'type\s*=\s*"([^"]+)"', re.IGNORECASE)
+_LOCALIZED_FILTER_RE = re.compile(r"\|\s*localized_(datetime|date)\b")
 
 
 def _line_of(text: str, pos: int) -> int:
@@ -122,6 +130,9 @@ def check_timestamps_wrapped(rel: str, text: str, lines: list[str]) -> list[Viol
             continue
         if "localized_time(" in line_text:
             continue
+        # The platform's filters render the <time datetime=...> element themselves.
+        if _LOCALIZED_FILTER_RE.search(line_text):
+            continue
         if _allowed("UX-IV", lines, line):
             continue
         out.append(Violation(
@@ -139,9 +150,9 @@ _PER_TEMPLATE_CHECKS = (
 )
 
 
-def check_foundation_scripts(app_root: str) -> list[Violation]:
+def check_foundation_scripts(app_root: str, templates_dir: str = "app/templates") -> list[Violation]:
     """FOUNDATION: base.html must load form_gating.js and localize_timestamps.js."""
-    base = os.path.join(app_root, "app", "templates", "base.html")
+    base = os.path.join(app_root, templates_dir, "base.html")
     if not os.path.isfile(base):
         return []
     with open(base, encoding="utf-8") as fh:
@@ -290,8 +301,8 @@ def check_sqlite_batch_migration_guard(app_root: str) -> list[Violation]:
     )]
 
 
-def _templates(app_root: str):
-    tdir = os.path.join(app_root, "app", "templates")
+def _templates(app_root: str, templates_dir: str = "app/templates"):
+    tdir = os.path.join(app_root, templates_dir)
     for root, _dirs, files in os.walk(tdir):
         for name in sorted(files):
             if name.endswith(".html"):
@@ -300,14 +311,20 @@ def _templates(app_root: str):
                     yield os.path.relpath(path, app_root), fh.read()
 
 
-def audit(app_root: str) -> list[Violation]:
-    """All convention violations under app_root, sorted by (file, line, rule)."""
+def audit(app_root: str, templates_dir: str = "app/templates", sqlite_checks: bool = True) -> list[Violation]:
+    """All convention violations under app_root, sorted by (file, line, rule).
+
+    templates_dir: where the templates live relative to app_root (a clone: app/templates;
+    the BMA platform: templates). sqlite_checks: the two SQLite migration guards apply to
+    clones, which ship on SQLite; the platform runs Postgres and passes False.
+    """
     out = []
-    for rel, text in _templates(app_root):
+    for rel, text in _templates(app_root, templates_dir):
         lines = text.splitlines()
         for check in _PER_TEMPLATE_CHECKS:
             out.extend(check(rel, text, lines))
-    out.extend(check_foundation_scripts(app_root))
-    out.extend(check_sqlite_foreign_keys(app_root))
-    out.extend(check_sqlite_batch_migration_guard(app_root))
+    out.extend(check_foundation_scripts(app_root, templates_dir))
+    if sqlite_checks:
+        out.extend(check_sqlite_foreign_keys(app_root))
+        out.extend(check_sqlite_batch_migration_guard(app_root))
     return sorted(out, key=lambda v: (v.file, v.line, v.rule))
