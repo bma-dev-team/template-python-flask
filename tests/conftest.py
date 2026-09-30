@@ -1,7 +1,8 @@
 """Test-session hooks shared by every build scaffolded from this template.
 
-Two things: say out loud when an entire parametrised leg did not run, and put
-back the per-test timeout that reporting a failure takes away.
+Three things: say out loud when an entire parametrised leg did not run, put
+back the per-test timeout that reporting a failure takes away, and give every
+test run a Postgres database of its own (`test_database_url`, at the bottom).
 
 **Why this exists.** Twice on the deposition build a whole verification leg was
 silently absent from every number anyone quoted, and both times the number
@@ -26,7 +27,9 @@ collection and every test carrying it was skipped.
 """
 from __future__ import annotations
 
+import os
 import re
+import secrets
 
 import pytest
 
@@ -143,3 +146,204 @@ def pytest_terminal_summary(terminalreporter, exitstatus, config):  # noqa: ARG0
         "  A green run here is not evidence about the leg above. If CI runs it, "
         "CI is testing something you did not."
     )
+
+
+# --- a Postgres database per test run (learning L86) -----------------------
+#
+# **Why this exists.** On the deposition build two sessions on one machine
+# shared one `TEST_DATABASE_URL`. One ran the full suite, whose fixtures
+# `drop_all()` / `create_all()` every few seconds; the other ran `flask
+# bootstrap` against the same database. For 45 minutes each session's failures
+# (missing relations, a deadlock in `drop_all`, a vanished `session` table)
+# looked like defects in its own code. A rule that says "use your own database"
+# depends on every build remembering it; this makes it the default.
+#
+# **How a build uses it:** take the database from the `test_database_url`
+# fixture, never from `os.environ`. `TEST_DATABASE_URL` then names a server and
+# a base database to connect through, not the database the tests write to.
+#
+# Reviewed on bma-dev-team/template-python-flask PR #1 (ERW, tier M, Level 2).
+
+TEST_DATABASE_URL_ENV = "TEST_DATABASE_URL"
+
+# The drivers whose connection arguments were checked (see _DESTINATION_KEYS).
+_POSTGRES_SCHEMES = {"postgresql", "postgres", "postgresql+psycopg", "postgresql+psycopg2"}
+
+# Query keys that choose the destination by a route other than the URL path.
+# SQLAlchemy's psycopg dialects build the connection arguments from the path and
+# then apply `opts.update(url.query)` (`create_connect_args`), so a retained
+# `?dbname=base` silently overrides the per-run database and the run is back on
+# the shared one. `service` selects through pg_service.conf; `host`, `hostaddr`
+# and `port` in the query are libpq multi-host selectors. The identity check in
+# `create_run_database` is the backstop for anything this list misses.
+_DESTINATION_KEYS = ("dbname", "database", "service", "host", "hostaddr", "port")
+
+# Postgres truncates identifiers longer than this silently (NAMEDATALEN - 1).
+_IDENTIFIER_MAX_BYTES = 63
+
+# Names this process created. The drop refuses anything else, including a name
+# that merely looks like a run database: it never matches by pattern.
+_created_databases: set[str] = set()
+
+
+class TestDatabaseRefused(ValueError):
+    """`TEST_DATABASE_URL` has a shape this fixture will not create a database for."""
+
+    __test__ = False  # not a test class, despite the name
+
+
+def _scheme(raw: str) -> str:
+    return raw.split("://", 1)[0].lower() if "://" in raw else ""
+
+
+def is_postgres_url(raw: str) -> bool:
+    """Whether a URL is Postgres at all, supported driver or not. Stdlib only."""
+    return _scheme(raw).split("+", 1)[0] in ("postgresql", "postgres")
+
+
+def checked_postgres_url(raw: str):
+    """Parse a Postgres `TEST_DATABASE_URL`, refusing any shape that could select
+    its database by a route other than the path. Nothing has been created yet."""
+    from sqlalchemy.engine import make_url
+
+    scheme = _scheme(raw)
+    if scheme not in _POSTGRES_SCHEMES:
+        raise TestDatabaseRefused(
+            f"{TEST_DATABASE_URL_ENV} uses {scheme!r}; supported: "
+            f"{', '.join(sorted(_POSTGRES_SCHEMES))}"
+        )
+    url = make_url(raw)
+    if url.drivername == "postgres":
+        # SQLAlchemy 2 has no dialect called `postgres`; it is the same database.
+        url = url.set(drivername="postgresql")
+    if not url.database:
+        raise TestDatabaseRefused(
+            f"{TEST_DATABASE_URL_ENV} names no database in its path; "
+            "it must name the base database to connect through"
+        )
+    selectors = sorted(k for k in url.query if k.lower() in _DESTINATION_KEYS)
+    if selectors:
+        raise TestDatabaseRefused(
+            f"{TEST_DATABASE_URL_ENV} selects its destination through the query "
+            f"key(s) {selectors}, which would override the per-run database; "
+            "name the database in the URL path and remove them (for a Unix "
+            "socket, leave the host empty, as in postgresql://user@/dbname, and "
+            "set PGHOST if the socket directory is not the default)"
+        )
+    return url
+
+
+def new_run_token() -> str:
+    """Different for every run, including two runs on one branch at once."""
+    return f"{os.getpid()}_{secrets.token_hex(3)}"
+
+
+def run_database_name(base: str, token: str) -> str:
+    """`<base>_run_<token>`, cut to 63 bytes of UTF-8 with the token kept whole."""
+    suffix = f"_run_{token}"
+    room = _IDENTIFIER_MAX_BYTES - len(suffix.encode("utf-8"))
+    head = base.encode("utf-8")[:room].decode("utf-8", "ignore")
+    return head + suffix
+
+
+def run_database_url(url, name: str):
+    """The same connection with only the path database replaced."""
+    return url.set(database=name)
+
+
+def create_run_database(url):
+    """Create this run's database and return `(run_url, name)`.
+
+    The destination is OBSERVED before anything is handed out: a connection
+    through the run URL must report the created database as current. On any
+    failure after CREATE, the database this call made is dropped again.
+    """
+    from sqlalchemy import create_engine, text
+
+    name = run_database_name(url.database, new_run_token())
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as conn:
+            quoted = admin.dialect.identifier_preparer.quote_identifier(name)
+            conn.execute(text(f"CREATE DATABASE {quoted}"))
+        _created_databases.add(name)  # only after CREATE succeeded
+    finally:
+        admin.dispose()
+
+    try:
+        run_url = run_database_url(url, name)
+        probe = create_engine(run_url)
+        try:
+            with probe.connect() as conn:
+                current = conn.execute(text("SELECT current_database()")).scalar()
+        finally:
+            probe.dispose()
+        if current != name:
+            raise RuntimeError(
+                f"the per-run URL connected to {current!r}, not the database "
+                f"created for this run ({name!r}); refusing to hand it out"
+            )
+    except BaseException:
+        drop_run_database(url, name)
+        raise
+    return run_url, name
+
+
+def drop_run_database(url, name: str) -> None:
+    """Drop a database this process created, and nothing else."""
+    if name not in _created_databases:
+        raise ValueError(f"refusing to drop {name!r}: this process did not create it")
+    from sqlalchemy import create_engine, text
+
+    admin = create_engine(url, isolation_level="AUTOCOMMIT")
+    try:
+        with admin.connect() as conn:
+            # DROP DATABASE fails while anyone is connected; a test that left a
+            # connection open would otherwise leave the database behind.
+            conn.execute(
+                text(
+                    "SELECT pg_terminate_backend(pid) FROM pg_stat_activity "
+                    "WHERE datname = :name AND pid <> pg_backend_pid()"
+                ),
+                {"name": name},
+            )
+            quoted = admin.dialect.identifier_preparer.quote_identifier(name)
+            conn.execute(text(f"DROP DATABASE IF EXISTS {quoted}"))
+        _created_databases.discard(name)
+    finally:
+        admin.dispose()
+
+
+@pytest.fixture(scope="session")
+def test_database_url():
+    """This run's own database URL, or None when `TEST_DATABASE_URL` is unset.
+
+    Loads `.env` before reading the variable: reading `os.environ` first is how
+    the deposition build twice skipped its whole Postgres leg on a machine where
+    it was configured. A non-Postgres URL is returned unchanged. Under
+    pytest-xdist every worker is its own session and gets its own database.
+    A run killed outright (SIGKILL, a runner timeout) leaves its
+    `<base>_run_*` database behind; it is never reused, because every run
+    derives a new name.
+    """
+    from dotenv import find_dotenv, load_dotenv
+
+    load_dotenv(find_dotenv(usecwd=True))
+    raw = os.environ.get(TEST_DATABASE_URL_ENV)
+    if not raw:
+        yield None
+        return
+    if not is_postgres_url(raw):
+        yield raw
+        return
+    url = checked_postgres_url(raw)
+    run_url, name = create_run_database(url)
+    try:
+        yield run_url.render_as_string(hide_password=False)
+    finally:
+        try:
+            drop_run_database(url, name)
+        except Exception as exc:  # the results stand; say what was left
+            import warnings
+
+            warnings.warn(f"per-run test database {name!r} was left behind: {exc}")
