@@ -7,7 +7,7 @@ ERW Level: 2 (the change issues `CREATE DATABASE` and `DROP DATABASE`; destructi
 Characterization: not triggered, because the Postgres behaviour relied on (`CREATE DATABASE` / `DROP DATABASE` outside a transaction, the 63-byte identifier limit, `pg_terminate_backend`) is long-stable documented behaviour, and the implementation's Postgres leg exercises each of them against a real server.
 Branch: erw/per-run-test-database
 Design commit: 6de5212 (round 0); the round 1 revision is the commit adding "Round history"
-Implementation: filled at step 4
+Implementation: 5c5f9db (implementation commit); this push. The head SHA and its CI run are named by the PR disposition comment for the head.
 PR: #1 (https://github.com/bma-dev-team/template-python-flask/pull/1)
 CI targets: tests/test_per_run_database.py tests/test_absent_leg_reporting.py (the template's workflow has no targeted mode and skips Draft PRs; each Draft head is run in full by `workflow_dispatch` on this branch, and that run is the disposition)
 
@@ -256,3 +256,56 @@ remove the backend termination (10 dies); drop `dbname` from the refusal list (4
 - Residue: nothing superseded; the template has no database fixture today.
 - Boundaries: template repository files only; no build repo, nothing
   installed or deployed.
+
+---
+
+# Implementation (filled at step 4)
+
+## Self-review (mandatory; one line per item, honest)
+- Failure direction: creation or refusal errors the fixture before any test gets a URL; a failed drop warns and names the leftover; the drop refuses any name not recorded after this process's own CREATE.
+- Concurrency and cross-session: measured, not argued: two concurrent inner sessions churning `DROP SCHEMA public CASCADE` on their own databases pass, with and without an unrelated query setting; the same pair on one shared database fails (the control), so the test can tell the difference.
+- Corrupt, missing, stale, or partial state (accessor audit; same-class sweep): the one accessor of `TEST_DATABASE_URL` in the template is this fixture (the other mention is a pytester string in `test_absent_leg_reporting.py`, which is fixture text, not a read). A killed run's `_run_` database is never reused.
+- Test validity (controls; baseline green; mutation anchors and set when they changed): baseline green before and after; controls above; mutation results below.
+- Residue sweep (terms searched: `TEST_DATABASE_URL`, `DATABASE_URL`, `drop_all`): nothing superseded; the template had no database fixture.
+- Evidence freshness: all runs below at implementation commit 5c5f9db, local, 2026-09-30.
+- Procedure post-conditions: no procedure.
+- CI baseline: the template's workflow skips Draft PRs, so this head is run in full by `workflow_dispatch` on the branch; the PR comment for this head names the run and is the disposition.
+- Boundaries (nothing installed, armed, deployed; repository files only): template repository files only. Locally, one scratch database `template_l86_base` on the local server, used by nothing else.
+- Mechanics: mutations applied to committed work with the restore in a `trap`; `git status` clean after.
+- Focused evidence: the material integration points are CREATE / identity check / DROP against a real Postgres 16 server through psycopg 3 and SQLAlchemy 2.1.1 (local), and the CI service container on both matrix Pythons (the dispatch run). Fixture difference: local connects over the Unix socket (`postgresql+psycopg://tim@/template_l86_base`), CI over TCP with a password.
+
+## Actual files changed
+- `tests/conftest.py`: `test_database_url` and its helpers (`checked_postgres_url`, `run_database_name`, `run_database_url`, `create_run_database`, `drop_run_database`, `TestDatabaseRefused`).
+- `tests/test_per_run_database.py`: new, 36 tests (27 pure or subprocess-only, 9 needing a server).
+- `.github/workflows/test.yml`: `postgres:16` service, `TEST_DATABASE_URL`, `psycopg[binary]` test-only.
+- `README.md`: "A database of your own for every test run".
+
+## Differences from the reviewed design
+- The refusal message says how to reach a Unix socket without `?host=` (leave the host empty; `PGHOST` for a non-default directory). Found while running locally: the obvious socket URL uses `?host=`, which the design refuses. Refusing it stays correct; the message now names the accepted form, so the refusal is not a dead end.
+- A drop that fails emits a `warnings.warn` rather than a print, because pytest captures session-teardown output and the line would not be seen.
+- Test 10 (a connection left open) and test 9a's `sslmode` variant use `application_name=l86` as the unrelated setting, because the local socket server does not do SSL; `sslmode` acceptance is covered by the pure tests and the DBAPI-argument test.
+
+## Tests run and results
+- `TEST_DATABASE_URL=postgresql+psycopg://tim@/template_l86_base pytest -rA tests/`: 133 passed, 3 skipped (the 3 pre-existing: two "INSTANTIATE THIS IN YOUR BUILD" and one "local run; CI is where the guard has to be proven"). 0 `_run_` databases left afterwards.
+- Same, without `TEST_DATABASE_URL`: 124 passed, 12 skipped (the 9 Postgres-leg tests skip locally with "TEST_DATABASE_URL is not set").
+- `CI=1`, no `TEST_DATABASE_URL`, `tests/test_per_run_database.py`: 27 passed, 9 errors: the Postgres leg refuses to skip in CI.
+
+## Mutation / adversarial tests
+Each applied to `tests/conftest.py` at 5c5f9db, run against `tests/test_per_run_database.py` with the real server:
+
+| Mutation | Killed by |
+| --- | --- |
+| remove the teardown drop | run-database-gone, failing-run-drops, connection-left-open, unrelated-setting |
+| constant run suffix | two-names, both concurrent-churn cases |
+| remove the drop guard | drop-refuses-a-name-it-did-not-create |
+| remove the backend termination | connection-left-open |
+| drop `dbname` from the refusal list | refused-key[dbname], refused-key[DBNAME], dbname-equal-to-path |
+| remove the identity check | identity-check-refuses |
+| equivalent rewrite of `run_database_url` (control) | survived, as it must |
+
+## Known limitations
+- A run killed outright leaves `<base>_run_<pid>_<hex>`; nothing sweeps it, deliberately (a sweep by pattern is the operation the design forbids). The README says so.
+- Existing builds are not changed; a build adopts this by taking its database from `test_database_url`.
+
+## Still uncertain
+- Nothing known.
