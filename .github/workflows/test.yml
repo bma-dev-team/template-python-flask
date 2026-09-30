@@ -34,6 +34,26 @@ jobs:
     # every push. Marking the PR "Ready for review" fires ready_for_review and
     # runs the job once, so a failure email then means a real problem.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
+    # A real Postgres server, so the per-run database fixture in
+    # tests/conftest.py (learning L86) is exercised here rather than skipped.
+    # TEST_DATABASE_URL names the server and a BASE database; each test run
+    # creates and drops its own database beside it.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/test
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-python@v6
@@ -49,5 +69,8 @@ jobs:
           # they importorskip, and a silent skip would leave the guard shipped
           # and unproven, which is worse than shipping no guard at all.
           pip install pytest sqlalchemy
+          # Test-only, for the same reason: the per-run database fixture's
+          # Postgres tests FAIL in CI without a driver rather than skip.
+          pip install "psycopg[binary]"
       - name: Run tests
         run: pytest -v

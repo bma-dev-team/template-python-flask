@@ -42,6 +42,18 @@ put the command HERE, and make the suite say what it skipped:
 pytest -rA          # -rA prints every skip WITH ITS REASON
 ```
 
+### A database of your own for every test run
+
+If the build tests against Postgres, set `TEST_DATABASE_URL` to a server and a
+**base** database (`postgresql+psycopg://user:pass@localhost/myapp_test`, or
+`postgresql+psycopg://user@/myapp_test` for the local Unix socket), and take the
+database in your fixtures from the `test_database_url` fixture in
+`tests/conftest.py`, **never from `os.environ`**. Each run then creates its own
+`<base>_run_<pid>_<hex>` database and drops it at the end, so two sessions, or
+a suite and a `flask bootstrap`, can no longer wipe each other's tables. A run
+killed outright leaves its `_run_` database behind; it is never reused and can
+be dropped by hand.
+
 A skip count is not information. A skip reason is. Read the reasons before
 believing a green run covered what you think it covered.
 
