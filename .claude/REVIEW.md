@@ -6,9 +6,9 @@ Consequence tier and why: M: the worst credible defect is the fixture dropping a
 ERW Level: 2 (the change issues `CREATE DATABASE` and `DROP DATABASE`; destructive operations default to Level 2)
 Characterization: not triggered, because the Postgres behaviour relied on (`CREATE DATABASE` / `DROP DATABASE` outside a transaction, the 63-byte identifier limit, `pg_terminate_backend`) is long-stable documented behaviour, and the implementation's Postgres leg exercises each of them against a real server.
 Branch: erw/per-run-test-database
-Design commit: this commit
+Design commit: 6de5212 (the design as first pushed; this line added after)
 Implementation: filled at step 4
-PR: filled when the Draft PR is opened
+PR: #1 (https://github.com/bma-dev-team/template-python-flask/pull/1)
 CI targets: tests/test_per_run_database.py tests/test_absent_leg_reporting.py (the template's workflow has no targeted mode and skips Draft PRs; each Draft head is run in full by `workflow_dispatch` on this branch, and that run is the disposition)
 
 ## Objective
